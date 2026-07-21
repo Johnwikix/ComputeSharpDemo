@@ -82,12 +82,15 @@ public sealed partial class MainWindow : Window
     {
         if (_activePass?.Capabilities.HasFlag(ShaderCapabilities.UsesMouse) == true)
         {
-            Point pt = e.GetCurrentPoint(_shaderPanel).Position;
-            _activePass.SetMouse(
-                (float)pt.X,
-                (float)pt.Y,
-                (float)_shaderPanel.ActualWidth,
-                (float)_shaderPanel.ActualHeight);
+            var pointerPoint = e.GetCurrentPoint(_shaderPanel);
+            if (pointerPoint.Properties.IsLeftButtonPressed)
+            {
+                _activePass.SetMouse(
+                    (float)pointerPoint.Position.X,
+                    (float)pointerPoint.Position.Y,
+                    (float)_shaderPanel.ActualWidth,
+                    (float)_shaderPanel.ActualHeight);
+            }
         }
     }
 
