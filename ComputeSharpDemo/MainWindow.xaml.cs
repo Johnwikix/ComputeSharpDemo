@@ -6,6 +6,7 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using System.Diagnostics;
 using Windows.Foundation;
+using DispatcherTimer = Microsoft.UI.Xaml.DispatcherTimer;
 
 namespace ComputeSharpDemo;
 
@@ -15,6 +16,7 @@ public sealed partial class MainWindow : Window
     private readonly ShaderFactory _factory;
     private readonly AnimatedComputeShaderPanel _shaderPanel;
     private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+    private int _fpsBaseline;
     private IShaderPass? _activePass;
     private bool _disposed;
 
@@ -29,7 +31,7 @@ public sealed partial class MainWindow : Window
         _shaderPanel = new AnimatedComputeShaderPanel(_device)
         {
             IsDynamicResolutionEnabled = false,
-            IsVerticalSyncEnabled = true,
+            IsVerticalSyncEnabled = false,
         };
 
         Grid.SetRow(_shaderPanel, 1);
@@ -42,6 +44,17 @@ public sealed partial class MainWindow : Window
         // Mouse tracking
         _shaderPanel.PointerMoved += OnPointerMoved;
         _shaderPanel.SizeChanged += OnShaderPanelSizeChanged;
+
+        // FPS counter (poll pass frame count every 500ms)
+        var fpsTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+        fpsTimer.Tick += (_, _) =>
+        {
+            int total = _activePass?.TotalFrames ?? 0;
+            int fps = (int)((total - _fpsBaseline) / 0.5);
+            FrameCountText.Text = $"FPS: {fps}";
+            _fpsBaseline = total;
+        };
+        fpsTimer.Start();
 
         // Cleanup
         Closed += (_, _) => Dispose();

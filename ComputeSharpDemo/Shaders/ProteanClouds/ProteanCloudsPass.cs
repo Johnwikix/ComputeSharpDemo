@@ -10,6 +10,7 @@ public sealed class ProteanCloudsPass : IShaderPass
 {
     private GraphicsDevice? _device;
     private Float2 _mouse;
+    private int _totalFrames;
     private bool _disposed;
 
     public string Id => "protean-clouds";
@@ -25,6 +26,8 @@ public sealed class ProteanCloudsPass : IShaderPass
         ShaderCapabilities.UsesTime
       | ShaderCapabilities.UsesMouse
       | ShaderCapabilities.UsesResolution;
+
+    public int TotalFrames => _totalFrames;
 
     public void SetMouse(float x, float y, float panelWidth, float panelHeight)
         => _mouse = new Float2(x, panelHeight - y);
@@ -48,6 +51,8 @@ public sealed class ProteanCloudsPass : IShaderPass
         _device.ForEach(
             texture,
             new ProteanCloudsShader(time, _mouse, resolution));
+
+        _totalFrames++;
 
         return true;
     }

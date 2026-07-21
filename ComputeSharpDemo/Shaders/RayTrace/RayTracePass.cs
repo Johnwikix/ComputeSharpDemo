@@ -8,6 +8,7 @@ public sealed class RayTracePass : IShaderPass
     private GraphicsDevice? _device;
     private Float2 _mouse;
     private int _frame;
+    private int _totalFrames;
     private bool _disposed;
 
     public string Id => "ray-trace";
@@ -23,6 +24,8 @@ public sealed class RayTracePass : IShaderPass
         ShaderCapabilities.UsesTime
       | ShaderCapabilities.UsesMouse
       | ShaderCapabilities.UsesResolution;
+
+    public int TotalFrames => _totalFrames;
 
     public void SetMouse(float x, float y, float panelWidth, float panelHeight)
     {
@@ -53,6 +56,7 @@ public sealed class RayTracePass : IShaderPass
             new RayTraceShader(time, _mouse, resolution, _frame, texture));
 
         _frame++;
+        _totalFrames++;
 
         return true;
     }

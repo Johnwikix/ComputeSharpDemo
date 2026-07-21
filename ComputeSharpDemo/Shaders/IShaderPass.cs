@@ -48,4 +48,7 @@ public interface IShaderPass
     /// Default no-op so shaders without mouse support don't have to implement it.
     /// </summary>
     void SetMouse(float x, float y, float panelWidth, float panelHeight) { }
+
+    /// <summary>Monotonically increasing frame counter (for FPS calculation).</summary>
+    int TotalFrames => 0;
 }
