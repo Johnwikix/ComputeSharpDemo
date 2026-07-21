@@ -24,6 +24,10 @@ public readonly partial struct RayTraceShader(
 
     private const float Gamma = 2.2f;
 
+    // Sun lighting
+    private static readonly Float3 SunDir = Hlsl.Normalize(new Float3(1.0f, 0.8f, -0.5f));
+    private static readonly Float3 SunColor = new(3.0f, 2.8f, 2.5f);
+
     // Sphere 0 — green lambertian
     private static readonly Float3 S0C = new(0, 1, 0);
     private static readonly float S0R = 1.0f;
@@ -52,12 +56,26 @@ public readonly partial struct RayTraceShader(
     private static readonly Float3 S3A = new(0.9f, 0.9f, 0.9f);
     private static readonly float S3P = 1.5f;
 
-    // Sphere 4 — ground plane
+    // Sphere 4 — ground plane (diffuse warm earth)
     private static readonly Float3 S4C = new(0, -1000, 0);
     private static readonly float S4R = 1000.0f;
-    private static readonly int S4T = 1;
-    private static readonly Float3 S4A = new(0.7f, 0.75f, 0.8f);
-    private static readonly float S4P = 0.4f;
+    private static readonly int S4T = 0;
+    private static readonly Float3 S4A = new(0.6f, 0.5f, 0.35f);
+    private static readonly float S4P = 0;
+
+    private static bool ShadowHit(Float3 ro, Float3 rd, float tMin, float tMax)
+    {
+        float t;
+        Float3 n;
+
+        if (HitSphere(ro, rd, S0C, S0R, tMin, tMax, out t, out n)) return true;
+        if (HitSphere(ro, rd, S1C, S1R, tMin, tMax, out t, out n)) return true;
+        if (HitSphere(ro, rd, S2C, S2R, tMin, tMax, out t, out n)) return true;
+        if (HitSphere(ro, rd, S3C, S3R, tMin, tMax, out t, out n)) return true;
+        if (HitSphere(ro, rd, S4C, S4R, tMin, tMax, out t, out n)) return true;
+
+        return false;
+    }
 
     private static Float2 Scale(Float2 v, float s) => new(v.X * s, v.Y * s);
     private static Float3 Scale(Float3 v, float s) => new(v.X * s, v.Y * s, v.Z * s);
@@ -164,9 +182,14 @@ public readonly partial struct RayTraceShader(
     private static Float3 GetSkyColor(Float3 dir)
     {
         float t = dir.Y * 0.5f + 0.5f;
-        Float3 bottom = new(0.05f, 0.05f, 0.15f);
-        Float3 top = new(0.6f, 0.8f, 1.0f);
-        return Hlsl.Lerp(bottom, top, t);
+        Float3 bottom = new(0.01f, 0.01f, 0.04f);
+        Float3 top = new(0.3f, 0.5f, 0.8f);
+        Float3 sky = Hlsl.Lerp(bottom, top, t);
+
+        float sunAngle = Hlsl.Max(Hlsl.Dot(dir, SunDir), 0.0f);
+        sky += SunColor * Hlsl.Pow(sunAngle, 200.0f) * 0.5f;
+
+        return sky * 0.3f;
     }
 
     public Float4 Execute()
@@ -232,6 +255,36 @@ public readonly partial struct RayTraceShader(
                     out position, out normal,
                     out matType, out matAlbedo, out matParam))
                 {
+                    float ndotl = Hlsl.Dot(normal, SunDir);
+                    if (ndotl > 0.0f)
+                    {
+                        Float3 shadowRo = position + normal * 0.001f;
+                        if (!ShadowHit(shadowRo, SunDir, 0.001f, 5000.0f))
+                        {
+                            if (matType == LAMB)
+                            {
+                                accum += mask * matAlbedo * SunColor * ndotl * (1.0f / PI);
+                            }
+                            else if (matType == METAL)
+                            {
+                                Float3 viewDir = -Hlsl.Normalize(rayRd);
+                                Float3 halfVec = Hlsl.Normalize(viewDir + SunDir);
+                                float ndoth = Hlsl.Max(Hlsl.Dot(normal, halfVec), 0.0f);
+                                float roughness = matParam * matParam + 0.001f;
+                                float spec = Hlsl.Pow(ndoth, 1.0f / roughness);
+                                accum += mask * matAlbedo * SunColor * spec * ndotl * 0.5f;
+                            }
+                            else if (matType == DIEL)
+                            {
+                                Float3 viewDir = -Hlsl.Normalize(rayRd);
+                                Float3 halfVec = Hlsl.Normalize(viewDir + SunDir);
+                                float ndoth = Hlsl.Max(Hlsl.Dot(normal, halfVec), 0.0f);
+                                float fresnel = Schlick(ndoth, matParam);
+                                accum += mask * SunColor * Hlsl.Pow(ndoth, 10.0f) * fresnel;
+                            }
+                        }
+                    }
+
                     if (matType == LAMB)
                     {
                         Float3 d = normal + RandomUnitVector(ref seed, uv);
@@ -298,7 +351,7 @@ public readonly partial struct RayTraceShader(
                 {
                     Float3 skyColor = GetSkyColor(Hlsl.Normalize(rayRd));
                     skyColor = Hlsl.Pow(skyColor, new Float3(Gamma, Gamma, Gamma));
-                    accum = mask * skyColor;
+                    accum += mask * skyColor;
                     break;
                 }
             }
