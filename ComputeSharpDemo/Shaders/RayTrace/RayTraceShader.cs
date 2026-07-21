@@ -237,7 +237,6 @@ public readonly partial struct RayTraceShader(
                         Float3 d = normal + RandomUnitVector(ref seed, uv);
                         rayRo = position;
                         rayRd = d;
-                        accum += matAlbedo * mask;
                         mask *= matAlbedo;
                     }
                     else if (matType == METAL)
@@ -249,7 +248,6 @@ public readonly partial struct RayTraceShader(
                         {
                             rayRo = position;
                             rayRd = d;
-                            accum += matAlbedo * mask;
                             mask *= matAlbedo;
                         }
                     }
@@ -293,7 +291,6 @@ public readonly partial struct RayTraceShader(
                             rayRd = refracted;
                         }
 
-                        accum += mask * attenuation;
                         mask *= attenuation;
                     }
                 }
