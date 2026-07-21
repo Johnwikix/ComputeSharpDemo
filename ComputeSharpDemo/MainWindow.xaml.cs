@@ -1,7 +1,6 @@
 using ComputeSharp;
 using ComputeSharp.WinUI;
 using ComputeSharpDemo.Shaders;
-using ComputeSharpDemo.Shaders.ProteanClouds;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
@@ -81,11 +80,10 @@ public sealed partial class MainWindow : Window
 
     private void OnPointerMoved(object sender, PointerRoutedEventArgs e)
     {
-        if (_activePass is ProteanCloudsPass protean &&
-            _activePass.Capabilities.HasFlag(ShaderCapabilities.UsesMouse))
+        if (_activePass?.Capabilities.HasFlag(ShaderCapabilities.UsesMouse) == true)
         {
             Point pt = e.GetCurrentPoint(_shaderPanel).Position;
-            protean.SetMouse(
+            _activePass.SetMouse(
                 (float)pt.X,
                 (float)pt.Y,
                 (float)_shaderPanel.ActualWidth,

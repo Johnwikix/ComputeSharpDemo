@@ -1,4 +1,5 @@
 using ComputeSharpDemo.Shaders.ProteanClouds;
+using ComputeSharpDemo.Shaders.RayTrace;
 
 namespace ComputeSharpDemo.Shaders;
 
@@ -25,6 +26,19 @@ public static class ShaderCatalog
                         | ShaderCapabilities.UsesResolution,
             OriginalUrl:  "https://www.shadertoy.com/view/3l23Rh",
             Factory:      static () => new ProteanCloudsPass()),
+        new ShaderAuthoringInfo(
+            Id:           "ray-trace",
+            DisplayName:  "Ray Trace",
+            Description:  "Monte Carlo path tracer with spheres.",
+            Author:       new ShaderAuthor(
+                              Name:    "RT Demo",
+                              Url:     null,
+                              License: "CC BY-NC-SA 3.0"),
+            Capabilities: ShaderCapabilities.UsesTime
+                        | ShaderCapabilities.UsesMouse
+                        | ShaderCapabilities.UsesResolution,
+            OriginalUrl:  null,
+            Factory:      static () => new RayTracePass()),
         // To add a new shader: append one entry here.
         //   - Write a `XxxPass : IShaderPass` class.
         //   - Add an entry above with `Factory: static () => new XxxPass()`.

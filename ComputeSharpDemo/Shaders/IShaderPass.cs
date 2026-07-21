@@ -41,4 +41,11 @@ public interface IShaderPass
     /// Called whenever the swap chain is resized.
     /// </summary>
     void OnResize(Int2 newSize);
+
+    /// <summary>
+    /// Reports mouse position (panel-space coordinates). Called only when
+    /// <see cref="Capabilities"/> includes <see cref="ShaderCapabilities.UsesMouse"/>.
+    /// Default no-op so shaders without mouse support don't have to implement it.
+    /// </summary>
+    void SetMouse(float x, float y, float panelWidth, float panelHeight) { }
 }
