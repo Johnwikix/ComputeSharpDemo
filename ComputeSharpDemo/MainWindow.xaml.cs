@@ -43,6 +43,7 @@ public sealed partial class MainWindow : Window
 
         // Mouse tracking
         _shaderPanel.PointerMoved += OnPointerMoved;
+        _shaderPanel.PointerWheelChanged += OnPointerWheelChanged;
         _shaderPanel.SizeChanged += OnShaderPanelSizeChanged;
 
         // FPS counter (poll pass frame count every 500ms)
@@ -104,6 +105,16 @@ public sealed partial class MainWindow : Window
                     (float)_shaderPanel.ActualWidth,
                     (float)_shaderPanel.ActualHeight);
             }
+        }
+    }
+
+    private void OnPointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (_activePass is not null)
+        {
+            var pointerPoint = e.GetCurrentPoint(_shaderPanel);
+            float delta = (float)pointerPoint.Properties.MouseWheelDelta / 120.0f;
+            _activePass.SetZoom(delta);
         }
     }
 

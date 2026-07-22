@@ -9,7 +9,8 @@ public readonly partial struct RayTraceShader(
     Float2 iMouse,
     Float2 iResolution,
     int frame,
-    IReadWriteNormalizedTexture2D<Float4> previousFrame) : IComputeShader<Float4>
+    IReadWriteNormalizedTexture2D<Float4> previousFrame,
+    float iDist) : IComputeShader<Float4>
 {
     private const int MaxWeight = 200;
     private const int MaxBounces = 10;
@@ -60,7 +61,7 @@ public readonly partial struct RayTraceShader(
     private static readonly Float3 S4C = new(0, -1000, 0);
     private static readonly float S4R = 1000.0f;
     private static readonly int S4T = 0;
-    private static readonly Float3 S4A = new(0.6f, 0.5f, 0.35f);
+    private static readonly Float3 S4A = new(0.9f, 0.9f, 0.9f);
     private static readonly float S4P = 0;
 
     private static bool ShadowHit(Float3 ro, Float3 rd, float tMin, float tMax)
@@ -208,7 +209,7 @@ public readonly partial struct RayTraceShader(
         float halfWidth = Hlsl.Tan(fov * PI / 360.0f);
         float halfHeight = halfWidth / ratio;
 
-        const float dist = 6.5f;
+        float dist = iDist;
         Float2 mousePos = iMouse / iResolution;
         if (mousePos.X == 0.0f && mousePos.Y == 0.0f)
             mousePos = new Float2(0.55f, 0.2f);

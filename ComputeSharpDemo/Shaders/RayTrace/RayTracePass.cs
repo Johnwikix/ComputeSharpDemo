@@ -7,6 +7,7 @@ public sealed class RayTracePass : IShaderPass
 {
     private GraphicsDevice? _device;
     private Float2 _mouse;
+    private float _dist = 6.5f;
     private int _frame;
     private int _totalFrames;
     private bool _disposed;
@@ -33,6 +34,13 @@ public sealed class RayTracePass : IShaderPass
         _frame = 0;
     }
 
+    public void SetZoom(float delta)
+    {
+        _dist *= 1.0f - delta * 0.1f;
+        _dist = float.Clamp(_dist, 1.0f, 50.0f);
+        _frame = 0;
+    }
+
     public void Initialize(GraphicsDevice device, Int2 initialSize)
     {
         _device = device;
@@ -53,7 +61,7 @@ public sealed class RayTracePass : IShaderPass
 
         _device.ForEach(
             texture,
-            new RayTraceShader(time, _mouse, resolution, _frame, texture));
+            new RayTraceShader(time, _mouse, resolution, _frame, texture, _dist));
 
         _frame++;
         _totalFrames++;

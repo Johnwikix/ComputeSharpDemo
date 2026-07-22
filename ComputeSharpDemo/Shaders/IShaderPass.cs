@@ -49,6 +49,13 @@ public interface IShaderPass
     /// </summary>
     void SetMouse(float x, float y, float panelWidth, float panelHeight) { }
 
+    /// <summary>
+    /// Handles scroll-wheel zoom. Called from <see cref="MainWindow"/> pointer wheel handler.
+    /// Positive <paramref name="delta"/> = zoom in, negative = zoom out.
+    /// Default no-op so shaders without zoom support don't have to implement it.
+    /// </summary>
+    void SetZoom(float delta) { }
+
     /// <summary>Monotonically increasing frame counter (for FPS calculation).</summary>
     int TotalFrames => 0;
 }
