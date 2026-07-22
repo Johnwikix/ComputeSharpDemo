@@ -57,7 +57,7 @@ public readonly partial struct RayTraceShader(
     private static readonly Float3 S3A = new(0.9f, 0.9f, 0.9f);
     private static readonly float S3P = 1.5f;
 
-    // Sphere 4 — ground plane (diffuse warm earth)
+    // Sphere 4 — ground plane
     private static readonly Float3 S4C = new(0, -1000, 0);
     private static readonly float S4R = 1000.0f;
     private static readonly int S4T = 0;
