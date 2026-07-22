@@ -82,18 +82,26 @@ public readonly partial struct RayTraceShader(
     private static Float3 Scale(Float3 v, float s) => new(v.X * s, v.Y * s, v.Z * s);
     private static Float4 Scale(Float4 v, float s) => new(v.X * s, v.Y * s, v.Z * s, v.W * s);
 
-    private static float Random(ref float seed, Float2 uv)
+    private static uint Rng(ref uint state)
     {
-        return Hlsl.Frac(Hlsl.Sin(Hlsl.Dot(uv, new Float2(12.9898f, 78.233f)) + seed++) * 43758.5453f);
+        uint old = state;
+        state = old * 747796405u + 2891336453u;
+        uint word = ((old >> ((int)(old >> 28) + 4)) ^ old) * 277803737u;
+        return (word >> 22) ^ word;
     }
 
-    private static Float3 RandomUnitVector(ref float seed, Float2 uv)
+    private static float Random(ref uint state)
     {
-        float theta = Random(ref seed, uv) * PI2;
-        float z = Random(ref seed, uv) * 2.0f - 1.0f;
+        return (float)(Rng(ref state) >> 8) / 16777215.0f;
+    }
+
+    private static Float3 RandomUnitVector(ref uint state)
+    {
+        float theta = Random(ref state) * PI2;
+        float z = Random(ref state) * 2.0f - 1.0f;
         float a = Hlsl.Sqrt(1.0f - z * z);
         Float3 vector = new(a * Hlsl.Cos(theta), a * Hlsl.Sin(theta), z);
-        return Scale(vector, Hlsl.Sqrt(Random(ref seed, uv)));
+        return Scale(vector, Hlsl.Sqrt(Random(ref state)));
     }
 
     private static Float3 RayPointAt(Float3 origin, Float3 dir, float t)
@@ -230,15 +238,15 @@ public readonly partial struct RayTraceShader(
         Float3 horizontal = Scale(u, halfWidth * 2.0f);
         Float3 vertical = Scale(v, halfHeight * 2.0f);
 
-        float seed = iTime;
+        uint rngState = (uint)(xy.X * 73856093 + xy.Y * 19349663 + (int)(iTime * 1000.0f) * 16777619 + frame * 83492791);
 
         Float3 color = Float3.Zero;
 
         for (int s = 0; s < Samples; s++)
         {
             Float3 dir = lowerLeft - origin;
-            dir += Scale(horizontal, pixelSize.X * Random(ref seed, uv) + uv.X);
-            dir += Scale(vertical, pixelSize.Y * Random(ref seed, uv) + uv.Y);
+            dir += Scale(horizontal, pixelSize.X * Random(ref rngState) + uv.X);
+            dir += Scale(vertical, pixelSize.Y * Random(ref rngState) + uv.Y);
 
             Float3 position, normal, matAlbedo;
             int matType;
@@ -286,9 +294,50 @@ public readonly partial struct RayTraceShader(
                         }
                     }
 
+                    // Environment light sampling: sample hemisphere + evaluate sky
+                    {
+                        float theta = Random(ref rngState) * PI2;
+                        float phi = Hlsl.Acos(Random(ref rngState));
+                        Float3 up = Hlsl.Abs(normal.Y) < 0.99f ? new Float3(0, 1, 0) : new Float3(1, 0, 0);
+                        Float3 x = Hlsl.Normalize(Hlsl.Cross(up, normal));
+                        Float3 z = Hlsl.Cross(normal, x);
+                        Float3 envDir = x * Hlsl.Sin(phi) * Hlsl.Cos(theta) + normal * Hlsl.Cos(phi) + z * Hlsl.Sin(phi) * Hlsl.Sin(theta);
+
+                        Float3 envRo = position + normal * 0.001f;
+                        if (!ShadowHit(envRo, envDir, 0.001f, 5000.0f))
+                        {
+                            Float3 envColor = GetSkyColor(envDir);
+                            envColor = Hlsl.Pow(envColor, new Float3(Gamma, Gamma, Gamma));
+                            float ndotenv = Hlsl.Cos(phi);
+                            float pdf = 1.0f / (2.0f * PI);
+
+                            if (matType == LAMB)
+                            {
+                                accum += mask * matAlbedo * envColor * ndotenv * (1.0f / PI) / pdf;
+                            }
+                            else if (matType == METAL)
+                            {
+                                Float3 viewDir = -Hlsl.Normalize(rayRd);
+                                Float3 halfVec = Hlsl.Normalize(viewDir + envDir);
+                                float ndoth = Hlsl.Max(Hlsl.Dot(normal, halfVec), 0.0f);
+                                float roughness = matParam * matParam + 0.001f;
+                                float spec = Hlsl.Pow(ndoth, 1.0f / roughness);
+                                accum += mask * matAlbedo * envColor * spec * ndotenv * 0.5f / pdf;
+                            }
+                            else if (matType == DIEL)
+                            {
+                                Float3 viewDir = -Hlsl.Normalize(rayRd);
+                                Float3 halfVec = Hlsl.Normalize(viewDir + envDir);
+                                float ndoth = Hlsl.Max(Hlsl.Dot(normal, halfVec), 0.0f);
+                                float fresnel = Schlick(ndoth, matParam);
+                                accum += mask * envColor * Hlsl.Pow(ndoth, 10.0f) * fresnel / pdf;
+                            }
+                        }
+                    }
+
                     if (matType == LAMB)
                     {
-                        Float3 d = normal + RandomUnitVector(ref seed, uv);
+                        Float3 d = normal + RandomUnitVector(ref rngState);
                         rayRo = position;
                         rayRd = d;
                         mask *= matAlbedo;
@@ -296,7 +345,7 @@ public readonly partial struct RayTraceShader(
                     else if (matType == METAL)
                     {
                         Float3 reflected = Hlsl.Reflect(rayRd, normal);
-                        Float3 d = Scale(RandomUnitVector(ref seed, uv), matParam) + reflected;
+                        Float3 d = Scale(RandomUnitVector(ref rngState), matParam) + reflected;
 
                         if (Hlsl.Dot(d, normal) > 0.0f)
                         {
@@ -334,7 +383,7 @@ public readonly partial struct RayTraceShader(
                         else
                             reflectProb = 1.0f;
 
-                        if (Random(ref seed, uv) < reflectProb)
+                        if (Random(ref rngState) < reflectProb)
                         {
                             rayRo = position;
                             rayRd = reflected;
