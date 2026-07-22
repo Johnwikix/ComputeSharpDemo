@@ -12,7 +12,7 @@ public readonly partial struct RayTraceShader(
     IReadWriteNormalizedTexture2D<Float4> previousFrame,
     float iDist) : IComputeShader<Float4>
 {
-    private const int MaxWeight = 200;
+    private const int MaxWeight = 100;
     private const int MaxBounces = 10;
     private const int Samples = 1;
 
