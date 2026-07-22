@@ -14,7 +14,7 @@ public readonly partial struct RayTraceShader(
 {
     private const int MaxWeight = 100;
     private const int MaxBounces = 10;
-    private const int Samples = 1;
+    private const int Samples = 4;
 
     private const float PI = 3.14159265359f;
     private const float PI2 = 6.28318530717f;
