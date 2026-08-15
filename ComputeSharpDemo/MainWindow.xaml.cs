@@ -37,10 +37,6 @@ public sealed partial class MainWindow : WindowEx
         AppWindow.TitleBar.ExtendsContentIntoTitleBar = true;
         AppWindow.TitleBar.PreferredHeightOption = TitleBarHeightOption.Standard;
         this.SetTitleBarBackgroundColors(Colors.Transparent);
-        if (AppWindow.Presenter is OverlappedPresenter overlapped)
-        {
-            overlapped.SetBorderAndTitleBar(hasBorder: true, hasTitleBar: false);
-        }
         // Create the GPU device and shader panel
         _device = GraphicsDevice.GetDefault();
         _factory = new ShaderFactory();
