@@ -1,13 +1,14 @@
 ﻿using System.Diagnostics;
-using System.Numerics;
 using System.Runtime.InteropServices;
 using ComputeSharp;
 using ComputeSharp.Interop;
 using Microsoft.UI.Dispatching;
 using SharpGen.Runtime;
+using Vortice;
 using Vortice.Direct3D;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
+using Windows.Graphics;
 using static Vortice.DXGI.ColorSpaceType;
 
 namespace ComputeSharpDemo.Hdr;
@@ -35,13 +36,30 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     /// <summary>Infinite wait constant for <see cref="WaitForSingleObjectEx"/>.</summary>
     private const uint InfiniteWait = 0xFFFFFFFF;
 
+    /// <summary>
+    /// Maximum wait for the frame-latency waitable object before re-checking for a pending
+    /// resize (bounds the wait so the render loop always stays responsive to UI changes).
+    /// </summary>
+    private const uint ResizePollIntervalMs = 100;
+
+    /// <summary>
+    /// How long a new size must remain unchanged before it is applied to the swap chain.
+    /// During window drags resize events arrive continuously; coalescing them avoids
+    /// resize storms and guarantees at least one present between two ResizeBuffers calls
+    /// (DXGI rejects back-to-back resizes without an intermediate present).
+    /// </summary>
+    private const long ResizeSettleIntervalMs = 30;
+
+    /// <summary>
+    /// Backoff between resize retries after a transient failure.
+    /// </summary>
+    private const long ResizeRetryIntervalMs = 500;
+
     /// <summary>IID of <c>ID3D12Device</c>.</summary>
     private static readonly Guid IID_ID3D12Device = new("189819F1-1DB6-4B57-BE54-1821339B85F7");
 
     /// <summary>IID of <c>ID3D12Resource</c> as defined by ComputeSharp's interop bindings.</summary>
     private static readonly Guid IID_ID3D12Resource = new("696442BE-A72E-4059-BC79-5B5C98040FAD");
-
-    private static readonly Matrix3x2 IdentityTransform = new(1, 0, 0, 1, 0, 0);
 
     private readonly HdrShaderPanel _owner;
     private readonly GraphicsDevice _device;
@@ -58,6 +76,12 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     private IntPtr _frameLatencyWaitableObject;
     private ISwapChainPanelNative* _swapChainPanelNative;
 
+    /// <summary>
+    /// Swap chains retired by previous replacements, kept alive until the renderer is disposed
+    /// (releasing them earlier freezes the panel's display on this system).
+    /// </summary>
+    private readonly List<IDXGISwapChain3> _retiredSwapChains = [];
+
     private HdrFullScreenPass _fullScreenPass = null!;
     private ID3D12DescriptorHeap _rtvHeap = null!;
     private ID3D12DescriptorHeap _srvHeap = null!;
@@ -70,15 +94,17 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     private volatile bool _isResizePending = true;
     private volatile float _width = 1;
     private volatile float _height = 1;
-    private volatile float _compositionScaleX = 1;
-    private volatile float _compositionScaleY = 1;
+    private volatile bool _presentedSinceResize = true;
+    private long _resizeQueuedAt;
+    private long _resizeRetryAt;
     private volatile bool _hdrMode;
     private volatile bool _colorSpaceApplied;
     private volatile float _sdrWhiteLevelInNits = 200;
     private volatile float _maxLuminanceInNits = 1000;
 
-    private volatile bool _outputHdrCapable;
-    private volatile float _outputMaxLuminanceInNits;
+    private bool _currentOutputHdrCapable;
+    private float _currentOutputMaxLuminanceInNits;
+    private RectInt32 _windowBounds;
 
     private volatile IHdrShaderRunner? _shaderRunner;
     private volatile bool _isPaused;
@@ -124,15 +150,15 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     public bool IsHdrEnabled => _hdrMode;
 
     /// <summary>
-    /// Gets whether the DXGI output hosting the swap chain is currently HDR-capable
-    /// (queried from the hardware after the first present, independent of WinRT detection).
+    /// Gets whether the DXGI output currently hosting the window is HDR-capable
+    /// (queried from the hardware, independent of WinRT detection).
     /// </summary>
-    public bool OutputHdrCapable => _outputHdrCapable;
+    public bool CurrentOutputHdrCapable => _currentOutputHdrCapable;
 
     /// <summary>
-    /// Gets the peak luminance (nits) of the DXGI output, if the query succeeded.
+    /// Gets the peak luminance (nits) of the current output, if the query succeeded.
     /// </summary>
-    public float OutputMaxLuminanceInNits => _outputMaxLuminanceInNits;
+    public float CurrentOutputMaxLuminanceInNits => _currentOutputMaxLuminanceInNits;
 
     /// <summary>
     /// Switches the swap chain color space between SDR and HDR10 (ST 2084 / BT.2020).
@@ -202,17 +228,33 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     }
 
     /// <summary>
-    /// Queries the DXGI outputs of all adapters to detect HDR capability and luminance data
-    /// directly from the hardware (composition swap chains do not support
-    /// <c>IDXGISwapChain::GetContainingOutput</c>, so all outputs are enumerated instead).
-    /// Runs on the render thread after the first present.
+    /// Records the window bounds (screen coordinates) used to determine which DXGI output
+    /// currently hosts the window. Call whenever the window moves or resizes.
     /// </summary>
-    private void QueryOutputCapabilities()
+    public void SetWindowBounds(RectInt32 bounds)
+    {
+        _windowBounds = bounds;
+    }
+
+    /// <summary>
+    /// Re-queries the DXGI outputs and updates the HDR state of the output currently hosting
+    /// the window (the output whose <c>DesktopCoordinates</c> intersects the window bounds the
+    /// most). If no window bounds are available yet, falls back to "any output is HDR" so that
+    /// single-monitor HDR setups work from the first frame. Raises
+    /// <see cref="HdrShaderPanel.OutputCapabilitiesChanged"/> when the state changes.
+    /// Thread-safe (DXGI factory calls are safe from any thread).
+    /// </summary>
+    public void RecheckOutput()
     {
         try
         {
+            RectInt32 bounds = _windowBounds;
+            bool hasBounds = bounds.Width > 0 && bounds.Height > 0;
+
             bool anyHdr = false;
-            float maxLuminance = 0;
+            bool currentHdr = false;
+            float currentMaxLuminance = 0;
+            float bestIntersection = -1;
 
             for (uint adapterIndex = 0; ; adapterIndex++)
             {
@@ -240,37 +282,83 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
                             {
                                 using IDXGIOutput6 output6 = output.QueryInterface<IDXGIOutput6>();
                                 OutputDescription1 description = output6.Description1;
+                                RawRect desktop = description.DesktopCoordinates;
 
-                                if (description.ColorSpace == RgbFullG2084NoneP2020)
+                                bool isHdr = description.ColorSpace == RgbFullG2084NoneP2020;
+                                anyHdr |= isHdr;
+
+                                if (hasBounds)
                                 {
-                                    anyHdr = true;
+                                    int interW = Math.Min(bounds.X + bounds.Width, desktop.Right)
+                                               - Math.Max(bounds.X, desktop.Left);
+                                    int interH = Math.Min(bounds.Y + bounds.Height, desktop.Bottom)
+                                               - Math.Max(bounds.Y, desktop.Top);
+
+                                    if (interW > 0 && interH > 0)
+                                    {
+                                        float intersection = (float)interW * interH;
+
+                                        if (intersection > bestIntersection)
+                                        {
+                                            bestIntersection = intersection;
+                                            currentHdr = isHdr;
+                                            currentMaxLuminance = description.MaxLuminance;
+                                        }
+                                    }
                                 }
-
-                                if (description.MaxLuminance > maxLuminance)
+                                else if (isHdr && description.MaxLuminance > currentMaxLuminance)
                                 {
-                                    maxLuminance = description.MaxLuminance;
+                                    currentMaxLuminance = description.MaxLuminance;
                                 }
 
                                 Debug.WriteLine(
-                                    $"[HDR] DXGI output {adapterIndex}.{outputIndex}: " +
+                                    $"[HDR] output {adapterIndex}.{outputIndex}: " +
                                     $"colorSpace={description.ColorSpace} maxLum={description.MaxLuminance:0} " +
-                                    $"bitsPerColor={description.BitsPerColor}");
+                                    $"desktop=({desktop.Left},{desktop.Top},{desktop.Right},{desktop.Bottom})");
                             }
                             catch (Exception e)
                             {
-                                Debug.WriteLine($"[HDR] DXGI output {adapterIndex}.{outputIndex} query failed: {e.Message}");
+                                Debug.WriteLine($"[HDR] output {adapterIndex}.{outputIndex} query failed: {e.Message}");
                             }
                         }
                     }
                 }
             }
 
-            _outputHdrCapable = anyHdr;
-            if (maxLuminance > 0) _outputMaxLuminanceInNits = maxLuminance;
+            bool foundOutput = hasBounds && bestIntersection >= 0;
+            bool newHdr;
+            float newLuminance;
 
-            Debug.WriteLine($"[HDR] DXGI outputs: hdr={anyHdr} maxLum={maxLuminance:0}");
+            if (foundOutput)
+            {
+                newHdr = currentHdr;
+                newLuminance = currentMaxLuminance;
+            }
+            else if (!hasBounds)
+            {
+                // No window bounds yet (first frames): fall back to "any output is HDR".
+                newHdr = anyHdr;
+                newLuminance = Math.Max(currentMaxLuminance, _currentOutputMaxLuminanceInNits);
+            }
+            else
+            {
+                // The window is not on any enumerated output (e.g. minimized or off-screen):
+                // keep the previous state.
+                newHdr = _currentOutputHdrCapable;
+                newLuminance = _currentOutputMaxLuminanceInNits;
+            }
 
-            _ = _dispatcherQueue.TryEnqueue(() => _owner.OnOutputCapabilitiesChanged());
+            bool changed = newHdr != _currentOutputHdrCapable || newLuminance != _currentOutputMaxLuminanceInNits;
+
+            _currentOutputHdrCapable = newHdr;
+            if (newLuminance > 0) _currentOutputMaxLuminanceInNits = newLuminance;
+
+            Debug.WriteLine($"[HDR] current output: hdr={_currentOutputHdrCapable} maxLum={_currentOutputMaxLuminanceInNits:0} (bounds={hasBounds})");
+
+            if (changed)
+            {
+                _ = _dispatcherQueue.TryEnqueue(() => _owner.OnOutputCapabilitiesChanged());
+            }
         }
         catch (Exception e)
         {
@@ -290,22 +378,15 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     }
 
     /// <summary>
-    /// Queues a resize of the render surface. Applies on the render thread.
+    /// Queues a resize of the render surface. Applies on the render thread once the size
+    /// has been stable for <see cref="ResizeSettleIntervalMs"/> (see
+    /// <see cref="TryApplyPendingResize"/>).
     /// </summary>
     public void QueueResize(double width, double height)
     {
         _width = (float)Math.Max(width, 1);
         _height = (float)Math.Max(height, 1);
-        _isResizePending = true;
-    }
-
-    /// <summary>
-    /// Queues a change of the composition scale factors.
-    /// </summary>
-    public void QueueCompositionScaleChange(double scaleX, double scaleY)
-    {
-        _compositionScaleX = (float)scaleX;
-        _compositionScaleY = (float)scaleY;
+        _resizeQueuedAt = Environment.TickCount64;
         _isResizePending = true;
     }
 
@@ -364,6 +445,8 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
 
     /// <summary>
     /// The core render loop, running on a dedicated background thread.
+    /// Every iteration is individually protected so that a transient failure in any
+    /// single step (resize, dispatch or present) never stops rendering permanently.
     /// </summary>
     private void RenderThreadMain()
     {
@@ -374,23 +457,33 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
 
             while (!cancellationToken.IsCancellationRequested)
             {
-                if (_isResizePending)
-                {
-                    ApplyResize();
-                }
 
-                IHdrShaderRunner? runner = _shaderRunner;
-                ReadWriteTexture2D<Rgba64, Float4>? frameBuffer = _frameBuffer;
-
-                if (runner is null || frameBuffer is null || _isPaused)
+                try
                 {
-                    Thread.Sleep(16);
-                    continue;
-                }
+                    if (TryApplyPendingResize())
+                    {
+                        continue;
+                    }
+
+                    IHdrShaderRunner? runner = _shaderRunner;
+                    ReadWriteTexture2D<Rgba64, Float4>? frameBuffer = _frameBuffer;
+
+                    if (runner is null || frameBuffer is null || _isPaused)
+                    {
+                        Thread.Sleep(16);
+                        continue;
+                    }
 
                 // Wait for the previous present to complete before touching the frame buffer again.
-                // This also paces the render loop to the display refresh rate.
-                WaitForSingleObjectEx(_frameLatencyWaitableObject, InfiniteWait, true);
+                // This also paces the render loop to the display refresh rate. The wait is bounded
+                // so that a resize requested while waiting is still applied promptly even if the
+                // waitable object misbehaves (returns on signal, otherwise after the timeout).
+                WaitForSingleObjectEx(_frameLatencyWaitableObject, ResizePollIntervalMs, true);
+
+                if (TryApplyPendingResize())
+                {
+                    continue;
+                }
 
                 HdrRenderParameters parameters = new(
                     IsHdrEnabled: _hdrMode,
@@ -404,11 +497,62 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
 
                 PresentFrame(frameBuffer);
             }
+            catch (Exception e)
+            {
+                // A single failed iteration must never kill the render loop.
+                Debug.WriteLine($"[HDR] render iteration failed: {e}");
+
+                Thread.Sleep(250);
+            }
+            }
         }
         catch (Exception e)
         {
             _ = _dispatcherQueue.TryEnqueue(() => _owner.OnRenderingFailed(e));
         }
+    }
+
+    /// <summary>
+    /// Applies a pending resize once the requested size has been stable for
+    /// <see cref="ResizeSettleIntervalMs"/>. Coalescing rapid resize events (e.g. during a
+    /// window drag) also guarantees that consecutive <c>ResizeBuffers</c> calls are always
+    /// separated by at least one present, which DXGI requires for flip-model swap chains.
+    /// </summary>
+    /// <returns>Whether a resize was applied by this call.</returns>
+    private bool TryApplyPendingResize()
+    {
+        if (!_isResizePending)
+        {
+            return false;
+        }
+
+        string? blocked = null;
+
+        // DXGI requires at least one Present between two consecutive ResizeBuffers calls.
+        if (!_presentedSinceResize)
+        {
+            blocked = "no-present-since-resize";
+        }
+
+        long now = Environment.TickCount64;
+
+        // Wait for the size to settle, and back off after a previous failure.
+        if (blocked is null && now - _resizeQueuedAt < ResizeSettleIntervalMs)
+        {
+            blocked = "settling";
+        }
+
+        if (blocked is null && now < _resizeRetryAt)
+        {
+            blocked = "backoff";
+        }
+
+        if (blocked is not null)
+        {
+            return false;
+        }
+
+        return ApplyResize();
     }
 
     /// <summary>
@@ -454,9 +598,26 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     {
         _dxgiFactory = DXGI.CreateDXGIFactory2<IDXGIFactory6>(debug: false);
 
+        _swapChainPanelNative = SwapChainPanelNativeMarshaller.GetNativeObject(_owner);
+
+        _swapChain = CreateSwapChain(width: 1, height: 1);
+        _frameLatencyWaitableObject = _swapChain.FrameLatencyWaitableObject;
+
+        // Attach the swap chain to the hosting panel.
+        // Note: the color space is intentionally NOT set here — a freshly created composition
+        // swap chain rejects SetColorSpace1 (E_INVALIDARG). It is applied by the render thread
+        // right after the first present, when the swap chain is fully initialized.
+        _swapChainPanelNative->SetSwapChain((void*)_swapChain.NativePointer).ThrowIfFailed();
+    }
+
+    /// <summary>
+    /// Creates a composition swap chain with the given buffer size.
+    /// </summary>
+    private IDXGISwapChain3 CreateSwapChain(uint width, uint height)
+    {
         SwapChainDescription1 description = new(
-            width: 1,
-            height: 1,
+            width: width,
+            height: height,
             format: Format.R10G10B10A2_UNorm,
             stereo: false,
             bufferUsage: Usage.RenderTargetOutput,
@@ -468,83 +629,186 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
 
         using IDXGISwapChain1 swapChain1 = _dxgiFactory.CreateSwapChainForComposition(_commandQueue, description, null);
 
-        _swapChain = swapChain1.QueryInterface<IDXGISwapChain3>();
-
-        // Start in SDR mode; SetHdrMode is called again once HDR detection completes.
-        SetHdrMode(isHdrEnabled: false);
-
-        _frameLatencyWaitableObject = _swapChain.FrameLatencyWaitableObject;
-
-        // Attach the swap chain to the hosting panel.
-        // Note: the color space is intentionally NOT set here 鈥?a freshly created composition
-        // swap chain rejects SetColorSpace1 (E_INVALIDARG). It is applied by the render thread
-        // right after the first present, when the swap chain is fully initialized.
-        _swapChainPanelNative = SwapChainPanelNativeMarshaller.GetNativeObject(_owner);
-
-        _swapChainPanelNative->SetSwapChain((void*)_swapChain.NativePointer).ThrowIfFailed();
+        return swapChain1.QueryInterface<IDXGISwapChain3>();
     }
 
     /// <summary>
-    /// Applies a pending resize: resizes the swap chain, recreates the render targets and the frame texture.
-    /// Runs on the render thread.
+    /// Replaces the current swap chain with a new one at the given size. Must be called from
+    /// the render thread; the panel binding is performed on the UI thread via the dispatcher
+    /// (the new chain is created and bound first, then the old one is released).
+    ///
+    /// <para>
+    /// Recreating the swap chain is required because <c>ResizeBuffers</c> on a swap chain
+    /// attached to a <see cref="SwapChainPanel"/> either silently defers on this system
+    /// (output stays locked at the previous size) or freezes the panel's display entirely.
+    /// </para>
     /// </summary>
-    private void ApplyResize()
+    /// <returns>Whether the swap chain was replaced.</returns>
+    private bool ReplaceSwapChain(uint width, uint height)
+    {
+        using ManualResetEventSlim done = new(false);
+
+        Exception? swapError = null;
+        bool swapped = false;
+
+        bool enqueued = _dispatcherQueue.TryEnqueue(() =>
+        {
+            IDXGISwapChain3? newSwapChain = null;
+
+            try
+            {
+                newSwapChain = CreateSwapChain(width, height);
+
+                // Rebind the panel to the new chain before releasing the old one.
+                _swapChainPanelNative->SetSwapChain((void*)newSwapChain.NativePointer).ThrowIfFailed();
+
+                // Defer the old chain's disposal: releasing a swap chain that was attached to
+                // the panel freezes the panel's display on this system, so retired chains are
+                // kept alive (and released together with the renderer).
+                _retiredSwapChains.Add(_swapChain);
+
+                // Ownership of the new chain transfers to the renderer.
+                _swapChain = newSwapChain;
+                newSwapChain = null;
+
+                _frameLatencyWaitableObject = _swapChain.FrameLatencyWaitableObject;
+
+                // The new chain starts in SDR: the color space is re-applied after its first present.
+                _colorSpaceApplied = false;
+
+                swapped = true;
+            }
+            catch (Exception e)
+            {
+                swapError = e;
+            }
+            finally
+            {
+                newSwapChain?.Dispose();
+
+                done.Set();
+            }
+        });
+
+        // The render thread must not touch the swap chain until the replacement is complete,
+        // so the wait is unbounded: a timed-out wait would let the render thread present on
+        // a chain the UI thread is about to dispose (access violation).
+        if (!enqueued)
+        {
+            return false;
+        }
+
+        done.Wait();
+
+        if (swapError is not null)
+        {
+            throw swapError;
+        }
+
+        return swapped;
+    }
+
+    /// <summary>
+    /// Applies a pending resize: replaces the swap chain, recreates the render targets and the frame texture.
+    /// Runs on the render thread. On failure the resize stays pending and is retried after
+    /// <see cref="ResizeRetryIntervalMs"/> — a transient DXGI error must never kill rendering.
+    /// </summary>
+    /// <returns>Whether the resize was applied successfully.</returns>
+    private bool ApplyResize()
     {
         _isResizePending = false;
 
-        int width = (int)Math.Min(Math.Max(Math.Ceiling(_width * _compositionScaleX), 1), 16384);
-        int height = (int)Math.Min(Math.Max(Math.Ceiling(_height * _compositionScaleY), 1), 16384);
+        // The size is already in physical pixels (the UI sizes the panel to the physical
+        // pixel size, see the bug #8219 workaround in MainWindow).
+        int width = (int)Math.Min(Math.Max(Math.Ceiling(_width), 1), 16384);
+        int height = (int)Math.Min(Math.Max(Math.Ceiling(_height), 1), 16384);
 
-        // Make sure no pending GPU work references the buffers we're about to recreate.
-        SignalAndWait();
-
-        _swapChain.ResizeBuffers(2, (uint)width, (uint)height, Format.R10G10B10A2_UNorm, SwapChainFlags.FrameLatencyWaitableObject);
-
-        float inverseScaleX = _compositionScaleX != 0 ? 1 / _compositionScaleX : 1;
-        float inverseScaleY = _compositionScaleY != 0 ? 1 / _compositionScaleY : 1;
-
-        _swapChain.MatrixTransform = inverseScaleX == 1 && inverseScaleY == 1
-            ? IdentityTransform
-            : new Matrix3x2(inverseScaleX, 0, 0, inverseScaleY, 0, 0);
-
-        // Resizing may reset the color space on some drivers: re-apply it once the swap
-        // chain has already been initialized (the first application happens after the
-        // first present, never on a fresh swap chain).
-        if (_colorSpaceApplied)
+        try
         {
-            TryApplyColorSpace(_hdrMode);
+            // DXGI flip-model back buffer objects must not outlive their swap chain: release
+            // them before the chain is replaced below.
+            for (int i = 0; i < _backBuffers.Length; i++)
+            {
+                _backBuffers[i]?.Dispose();
+                _backBuffers[i] = null;
+            }
+
+            // Make sure no pending GPU work references the buffers we're about to recreate.
+            SignalAndWait();
+
+            // ResizeBuffers is unreliable on a swap chain attached to a SwapChainPanel on
+            // this system (it silently defers or freezes the panel's display). Recreate the
+            // whole swap chain instead — the panel binding happens on the UI thread; the new
+            // chain is created and bound before the old one is released.
+            if (!ReplaceSwapChain((uint)width, (uint)height))
+            {
+                throw new InvalidOperationException("Failed to replace the swap chain (dispatcher unavailable).");
+            }
+
+            SwapChainDescription1 swapChainDesc = _swapChain.Description1;
+
+            if (swapChainDesc.Width != (uint)width || swapChainDesc.Height != (uint)height)
+            {
+                throw new InvalidOperationException(
+                    $"Swap chain replace failed: requested {width}x{height}, got {swapChainDesc.Width}x{swapChainDesc.Height}.");
+            }
+
+            // No matrix transform is applied: the panel presents the swapchain buffer at
+            // 1 buffer pixel = 1 DIP (WinUI bug #8219), and the panel itself is sized to
+            // the physical pixel size, so the buffer maps 1:1 onto the panel.
+
+            // Resizing may reset the color space on some drivers: re-apply it once the swap
+            // chain has already been initialized (the first application happens after the
+            // first present, never on a fresh swap chain).
+            if (_colorSpaceApplied)
+            {
+                TryApplyColorSpace(_hdrMode);
+            }
+
+            CpuDescriptorHandle rtvHeapStart = _rtvHeap.GetCPUDescriptorHandleForHeapStart();
+
+            for (int i = 0; i < _backBuffers.Length; i++)
+            {
+                _backBuffers[i] = _swapChain.GetBuffer<ID3D12Resource>((uint)i);
+
+                _d3D12Device.CreateRenderTargetView(_backBuffers[i], null, rtvHeapStart + i * _rtvIncrementSize);
+            }
+
+            // Recreate the frame texture and its shader resource view.
+            _frameResource?.Dispose();
+            _frameBuffer?.Dispose();
+
+            _frameBuffer = _device.AllocateReadWriteTexture2D<Rgba64, Float4>(width, height);
+
+            Guid resourceIid = IID_ID3D12Resource;
+            IntPtr resourcePointer = IntPtr.Zero;
+
+            InteropServices.GetID3D12Resource(_frameBuffer, &resourceIid, (void**)&resourcePointer);
+
+            _frameResource = new ID3D12Resource(resourcePointer);
+
+            // Use a null description so the runtime infers it from the resource
+            // (Texture2D, R16G16B16A16_UNORM, mip 0) — explicit Vortice descriptions
+            // have a layout that crashes the native call.
+            _d3D12Device.CreateShaderResourceView(_frameResource, null, _srvHeap.GetCPUDescriptorHandleForHeapStart());
+
+            _presentedSinceResize = false;
+
+            return true;
         }
-
-        CpuDescriptorHandle rtvHeapStart = _rtvHeap.GetCPUDescriptorHandleForHeapStart();
-
-        for (int i = 0; i < _backBuffers.Length; i++)
+        catch (Exception e)
         {
-            _backBuffers[i]?.Dispose();
+            // Keep the resize pending and back off: the render loop keeps rendering at the
+            // last good size in the meantime. If the frame texture was already replaced,
+            // the next retry recreates the whole chain again.
+            Debug.WriteLine($"[HDR] ApplyResize {width}x{height} failed: {e}");
 
-            _backBuffers[i] = _swapChain.GetBuffer<ID3D12Resource>((uint)i);
+            _isResizePending = true;
+            _resizeRetryAt = Environment.TickCount64 + ResizeRetryIntervalMs;
 
-            _d3D12Device.CreateRenderTargetView(_backBuffers[i], null, rtvHeapStart + i * _rtvIncrementSize);
+            return false;
         }
-
-        // Recreate the frame texture and its shader resource view.
-        _frameResource?.Dispose();
-        _frameBuffer?.Dispose();
-
-        _frameBuffer = _device.AllocateReadWriteTexture2D<Rgba64, Float4>(width, height);
-
-        Guid resourceIid = IID_ID3D12Resource;
-        IntPtr resourcePointer = IntPtr.Zero;
-
-        InteropServices.GetID3D12Resource(_frameBuffer, &resourceIid, (void**)&resourcePointer);
-
-        _frameResource = new ID3D12Resource(resourcePointer);
-
-        // Use a null description so the runtime infers it from the resource
-        // (Texture2D, R16G16B16A16_UNORM, mip 0) 鈥?explicit Vortice descriptions
-        // have a layout that crashes the native call.
-        _d3D12Device.CreateShaderResourceView(_frameResource, null, _srvHeap.GetCPUDescriptorHandleForHeapStart());
     }
-
     /// <summary>
     /// Runs the fullscreen conversion pass and presents the frame.
     /// </summary>
@@ -584,14 +848,22 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
         _commandList.Close();
 
         _commandQueue.ExecuteCommandLists(new ID3D12CommandList[] { _commandList });
+
         _swapChain.Present(0, PresentFlags.None);
 
+        // Retired swap chains are NOT disposed here: on this system releasing a swap chain
+        // that was attached to the panel (even long after the swap) freezes the panel's
+        // display. They are kept alive until the renderer is disposed.
+
+        // A present has now been issued since the last resize (if any).
+        _presentedSinceResize = true;
+
         // After the first present the swap chain is fully initialized: apply the pending
-        // color space (HDR toggle or detection result) and query the output capabilities.
+        // color space (HDR toggle or detection result) and re-query the output capabilities.
         if (!_colorSpaceApplied)
         {
             EnsureColorSpaceApplied();
-            QueryOutputCapabilities();
+            RecheckOutput();
         }
     }
 
@@ -644,6 +916,11 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
         _commandAllocator.Dispose();
         _fence.Dispose();
         _commandQueue.Dispose();
+        foreach (IDXGISwapChain3 retired in _retiredSwapChains)
+        {
+            retired.Dispose();
+        }
+        _retiredSwapChains.Clear();
         _swapChain.Dispose();
         _dxgiFactory.Dispose();
 
@@ -684,5 +961,8 @@ internal static class HresultExtensions
         }
     }
 }
+
+
+
 
 

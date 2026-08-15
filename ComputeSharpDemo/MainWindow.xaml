@@ -14,7 +14,7 @@
         <MicaBackdrop />
     </Window.SystemBackdrop>
 
-    <Grid x:Name="RootGrid" RowDefinitions="Auto,*">
+    <Grid x:Name="RootGrid" RowDefinitions="Auto,*" SizeChanged="OnRootGridSizeChanged">
         <!-- Toolbar -->
         <Grid Grid.Row="0" Margin="12,8" ColumnDefinitions="Auto,*,Auto,Auto,Auto">
             <ComboBox x:Name="ShaderSelector"
@@ -48,5 +48,11 @@
                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                        FontSize="13" />
         </Grid>
+
+        <!-- GPU surface. SwapChainPanel displays swapchain buffer pixels as DIPs
+             (WinUI bug #8219): the host is sized to the physical pixel size so the
+             full buffer is visible, and the panel is counter-scaled by 1/DpiScale
+             to fit the layout again (the panel itself always arranges at its slot size). -->
+        <Canvas x:Name="PanelHost" Grid.Row="1" />
     </Grid>
 </Window>
