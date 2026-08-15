@@ -1,5 +1,5 @@
 using ComputeSharp;
-using ComputeSharp.WinUI;
+using ComputeSharpDemo.Hdr;
 
 namespace ComputeSharpDemo.Shaders.ProteanClouds;
 
@@ -38,19 +38,29 @@ public sealed class ProteanCloudsPass : IShaderPass
     public void OnResize(Int2 newSize) { }
 
     public bool TryExecute(
-        IReadWriteNormalizedTexture2D<Float4> texture,
+        ReadWriteTexture2D<Rgba64, Float4> texture,
+        int width,
+        int height,
         TimeSpan timespan,
         object? parameter)
     {
         if (_device is null)
             throw new InvalidOperationException("Initialize must be called before dispatch.");
 
+        HdrRenderParameters hdr = parameter is HdrRenderParameters parameters ? parameters : HdrRenderParameters.Default;
+
         float time = (float)timespan.TotalSeconds;
-        Float2 resolution = new(texture.Width, texture.Height);
+        Float2 resolution = new(width, height);
 
         _device.ForEach(
             texture,
-            new ProteanCloudsShader(time, _mouse, resolution));
+            new ProteanCloudsShader(
+                time,
+                _mouse,
+                resolution,
+                hdr.IsHdrEnabled,
+                hdr.SdrWhiteLevelInNits,
+                hdr.MaxLuminanceInNits));
 
         _totalFrames++;
 

@@ -10,7 +10,10 @@ public readonly partial struct RayTraceShader(
     Float2 iResolution,
     int frame,
     IReadWriteNormalizedTexture2D<Float4> previousFrame,
-    float iDist) : IComputeShader<Float4>
+    float iDist,
+    bool isHdrEnabled,
+    float sdrWhiteLevelInNits,
+    float maxLuminanceInNits) : IComputeShader<Float4>
 {
     private const int MaxWeight = 100;
     private const int MaxBounces = 10;
@@ -411,7 +414,18 @@ public readonly partial struct RayTraceShader(
 
         color /= Samples;
 
-        color = Hlsl.Pow(color, new Float3(1.0f / Gamma, 1.0f / Gamma, 1.0f / Gamma));
+        // Encode the linear radiance for the current display: PQ for HDR10, sRGB gamma for SDR.
+        // The temporal accumulation below runs in the same (encoded) space as the previous frame.
+        if (isHdrEnabled)
+        {
+            Float3 nits = Hlsl.Min(color * sdrWhiteLevelInNits, maxLuminanceInNits);
+
+            color = PqEncode(nits);
+        }
+        else
+        {
+            color = Hlsl.Pow(Hlsl.Max(color, Float3.Zero), new Float3(1.0f / Gamma, 1.0f / Gamma, 1.0f / Gamma));
+        }
 
         Float4 previousColor = previousFrame[xy];
 
@@ -420,5 +434,18 @@ public readonly partial struct RayTraceShader(
         Float3 newColor = Hlsl.Lerp(previousColor.RGB, color, 1.0f / weight);
 
         return new Float4(newColor, 1.0f);
+    }
+
+    // ST 2084 (PQ) inverse EOTF, mapping linear luminance in nits to [0, 1] signal values
+    private static Float3 PqEncode(Float3 linearNits)
+    {
+        linearNits = Hlsl.Max(linearNits, Float3.Zero);
+
+        Float3 n = linearNits / 10000.0f;
+        Float3 y = Hlsl.Pow(n, new Float3(0.1593017578125f, 0.1593017578125f, 0.1593017578125f));
+        Float3 num = 0.8359375f + 18.8515625f * y;
+        Float3 den = 1.0f + 18.6875f * y;
+
+        return Hlsl.Pow(num / den, new Float3(78.84375f, 78.84375f, 78.84375f));
     }
 }

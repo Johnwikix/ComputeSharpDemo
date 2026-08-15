@@ -1,4 +1,5 @@
 using ComputeSharp;
+using ComputeSharpDemo.Hdr;
 
 namespace ComputeSharpDemo.Shaders;
 
@@ -6,13 +7,13 @@ namespace ComputeSharpDemo.Shaders;
 /// Contract every selectable shader implements. One instance per active shader —
 /// see <see cref="ShaderFactory"/> for lifetime management.
 ///
-/// Implementations are also <see cref="ComputeSharp.WinUI.IShaderRunner"/>s,
-/// which is the interface <see cref="ComputeSharp.WinUI.AnimatedComputeShaderPanel"/>
-/// uses to dispatch frames to its GPU texture each tick.
+/// Implementations are also <see cref="IHdrShaderRunner"/>s,
+/// which is the interface <see cref="Hdr.HdrShaderPanel"/>
+/// uses to dispatch frames to its GPU buffer each tick.
 /// </summary>
 public interface IShaderPass
     : IDisposable,
-      ComputeSharp.WinUI.IShaderRunner
+      IHdrShaderRunner
 {
     /// <summary>Stable identifier (used as a key in the catalog &amp; settings).</summary>
     string Id { get; }
@@ -55,7 +56,4 @@ public interface IShaderPass
     /// Default no-op so shaders without zoom support don't have to implement it.
     /// </summary>
     void SetZoom(float delta) { }
-
-    /// <summary>Monotonically increasing frame counter (for FPS calculation).</summary>
-    int TotalFrames => 0;
 }

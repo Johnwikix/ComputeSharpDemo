@@ -1,4 +1,4 @@
-using ComputeSharp;
+﻿using ComputeSharp;
 
 namespace ComputeSharpDemo.Shaders.ProteanClouds;
 
@@ -11,7 +11,10 @@ namespace ComputeSharpDemo.Shaders.ProteanClouds;
 public readonly partial struct ProteanCloudsShader(
     float iTime,
     Float2 iMouse,
-    Float2 iResolution) : IComputeShader<Float4>
+    Float2 iResolution,
+    bool isHdrEnabled,
+    float sdrWhiteLevelInNits,
+    float maxLuminanceInNits) : IComputeShader<Float4>
 {
     private static readonly Float3x3 M3 = new(
          0.33338f * 1.93f, -0.87887f * 1.93f, 0.15162f * 1.93f,
@@ -21,6 +24,9 @@ public readonly partial struct ProteanCloudsShader(
     public Float4 Execute()
     {
         Int2 xy = ThreadIds.XY;
+        if (xy.X >= iResolution.X || xy.Y >= iResolution.Y)
+            return Float4.Zero;
+
         Float2 fragCoord = new(xy.X + 0.5f, iResolution.Y - (xy.Y + 0.5f));
         Float2 q = fragCoord / iResolution;
         Float2 p  = (fragCoord - Scale(iResolution, 0.5f)) / iResolution.YY;
@@ -64,7 +70,27 @@ public readonly partial struct ProteanCloudsShader(
             Hlsl.Pow(col.Z, 0.60f)) * new Float3(1.0f, 0.97f, 0.9f);
         col = Scale(col, Hlsl.Pow(16.0f * q.X * q.Y * (1.0f - q.X) * (1.0f - q.Y), 0.12f) * 0.7f + 0.3f);
 
+        if (isHdrEnabled)
+        {
+            Float3 nits = Hlsl.Min(col * sdrWhiteLevelInNits, maxLuminanceInNits);
+
+            return new Float4(PqEncode(nits), 1.0f);
+        }
+
         return new Float4(Hlsl.Saturate(col.X), Hlsl.Saturate(col.Y), Hlsl.Saturate(col.Z), 1.0f);
+    }
+
+    // ST 2084 (PQ) inverse EOTF, mapping linear luminance in nits to [0, 1] signal values
+    private static Float3 PqEncode(Float3 linearNits)
+    {
+        linearNits = Hlsl.Max(linearNits, Float3.Zero);
+
+        Float3 n = linearNits / 10000.0f;
+        Float3 y = Hlsl.Pow(n, new Float3(0.1593017578125f, 0.1593017578125f, 0.1593017578125f));
+        Float3 num = 0.8359375f + 18.8515625f * y;
+        Float3 den = 1.0f + 18.6875f * y;
+
+        return Hlsl.Pow(num / den, new Float3(78.84375f, 78.84375f, 78.84375f));
     }
 
     private static Float2 Scale(Float2 v, float s) => new(v.X * s, v.Y * s);
@@ -164,3 +190,4 @@ public readonly partial struct ProteanCloudsShader(
         return Hlsl.Clamp(ic, 0.0f, 1.0f);
     }
 }
+
