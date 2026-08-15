@@ -28,6 +28,7 @@
     <PackageReference Include="Vortice.D3DCompiler" Version="3.6.2" />
     <PackageReference Include="Vortice.Direct3D12" Version="3.6.2" />
     <PackageReference Include="Vortice.DXGI" Version="3.6.2" />
+	<PackageReference Include="WinUIEx" Version="2.9.2" />
   </ItemGroup>
 
   

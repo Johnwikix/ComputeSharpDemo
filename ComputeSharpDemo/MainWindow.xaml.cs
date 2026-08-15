@@ -2,17 +2,17 @@ using ComputeSharp;
 using ComputeSharpDemo.Hdr;
 using ComputeSharpDemo.Shaders;
 using Microsoft.UI.Xaml;
-using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using System.Diagnostics;
 using Microsoft.UI.Windowing;
-using Windows.Foundation;
 using Windows.Graphics;
+using WinUIEx;
 using DispatcherTimer = Microsoft.UI.Xaml.DispatcherTimer;
+using Microsoft.UI;
 
 namespace ComputeSharpDemo;
 
-public sealed partial class MainWindow : Window
+public sealed partial class MainWindow : WindowEx
 {
     private GraphicsDevice _device = null!;
     private ShaderFactory _factory = null!;
@@ -33,7 +33,14 @@ public sealed partial class MainWindow : Window
     {
         InitializeComponent();
         Title = "ComputeSharp Demo";
-
+        AppWindow.TitleBar.PreferredTheme = TitleBarTheme.UseDefaultAppMode;
+        AppWindow.TitleBar.ExtendsContentIntoTitleBar = true;
+        AppWindow.TitleBar.PreferredHeightOption = TitleBarHeightOption.Standard;
+        this.SetTitleBarBackgroundColors(Colors.Transparent);
+        if (AppWindow.Presenter is OverlappedPresenter overlapped)
+        {
+            overlapped.SetBorderAndTitleBar(hasBorder: true, hasTitleBar: false);
+        }
         // Create the GPU device and shader panel
         _device = GraphicsDevice.GetDefault();
         _factory = new ShaderFactory();
