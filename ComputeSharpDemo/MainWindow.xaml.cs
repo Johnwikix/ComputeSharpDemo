@@ -387,7 +387,9 @@ public sealed partial class MainWindow : Window
         _shaderPanel.Dispose();
         _factory.Dispose();
         _hdrTracker?.Dispose();
-        _device.Dispose();
+
+        // Note: the GraphicsDevice is disposed by the renderer's background disposal
+        // (it must happen after the render thread has exited).
         _stopwatch.Stop();
     }
 }

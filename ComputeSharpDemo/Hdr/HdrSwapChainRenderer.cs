@@ -82,6 +82,11 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     /// </summary>
     private readonly List<IDXGISwapChain3> _retiredSwapChains = [];
 
+    /// <summary>
+    /// Signals that the panel has been detached from the swap chain (phase 1 of disposal).
+    /// </summary>
+    private readonly ManualResetEventSlim _detachDone = new(false);
+
     private HdrFullScreenPass _fullScreenPass = null!;
     private ID3D12DescriptorHeap _rtvHeap = null!;
     private ID3D12DescriptorHeap _srvHeap = null!;
@@ -659,6 +664,14 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
             {
                 newSwapChain = CreateSwapChain(width, height);
 
+                // The panel may already be detached while the app is closing; the swap chain
+                // binding is gone, so there is nothing to rebind and the old chain must stay
+                // with the renderer (it is released by the background disposal).
+                if (_swapChainPanelNative is null)
+                {
+                    throw new InvalidOperationException("Swap chain panel is already detached.");
+                }
+
                 // Rebind the panel to the new chain before releasing the old one.
                 _swapChainPanelNative->SetSwapChain((void*)newSwapChain.NativePointer).ThrowIfFailed();
 
@@ -888,45 +901,82 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
         if (_disposed) return;
         _disposed = true;
 
-        StopRenderLoop();
-
-        // Must run on the UI thread: releases the swap chain the panel is holding onto.
+        // Phase 1 (UI thread, caller): release the panel's reference to the swap chain.
+        // This is the only part that requires the UI thread and must complete before
+        // the swap chains are released below.
         if (_dispatcherQueue.HasThreadAccess)
         {
             DetachSwapChain();
+            _detachDone.Set();
         }
         else
         {
-            _dispatcherQueue.TryEnqueue(DetachSwapChain);
+            _dispatcherQueue.TryEnqueue(() =>
+            {
+                try
+                {
+                    DetachSwapChain();
+                }
+                finally
+                {
+                    _detachDone.Set();
+                }
+            });
         }
 
-        SignalAndWait();
+        // Phase 2 (background thread): all blocking teardown — render thread join, GPU
+        // drain and swap chain disposal can take seconds (compositor retirement, large
+        // shader dispatches), so closing the window must not block on them.
+        ThreadPool.QueueUserWorkItem(static state => ((HdrSwapChainRenderer)state!).DisposeResources());
+    }
 
-        for (int i = 0; i < _backBuffers.Length; i++)
+    /// <summary>
+    /// Performs the blocking part of the disposal on a background thread.
+    /// </summary>
+    private void DisposeResources()
+    {
+        try
         {
-            _backBuffers[i]?.Dispose();
-        }
+            // Best effort wait for the UI-thread detach (in practice it already ran).
+            _detachDone.Wait(TimeSpan.FromSeconds(2));
 
-        _frameResource?.Dispose();
-        _frameBuffer?.Dispose();
-        _srvHeap.Dispose();
-        _rtvHeap.Dispose();
-        _fullScreenPass.Dispose();
-        _commandList.Dispose();
-        _commandAllocator.Dispose();
-        _fence.Dispose();
-        _commandQueue.Dispose();
-        foreach (IDXGISwapChain3 retired in _retiredSwapChains)
+            StopRenderLoop();
+
+            SignalAndWait();
+
+            for (int i = 0; i < _backBuffers.Length; i++)
+            {
+                _backBuffers[i]?.Dispose();
+            }
+
+            _frameResource?.Dispose();
+            _frameBuffer?.Dispose();
+            _srvHeap.Dispose();
+            _rtvHeap.Dispose();
+            _fullScreenPass.Dispose();
+            _commandList.Dispose();
+            _commandAllocator.Dispose();
+            _fence.Dispose();
+            _commandQueue.Dispose();
+            foreach (IDXGISwapChain3 retired in _retiredSwapChains)
+            {
+                retired.Dispose();
+            }
+            _retiredSwapChains.Clear();
+            _swapChain.Dispose();
+            _dxgiFactory.Dispose();
+
+            // Release the reference we obtained on the underlying D3D12 device. The device
+            // itself is owned by the ComputeSharp GraphicsDevice instance, which is disposed
+            // here as well — it must happen after the render thread has exited so its queues
+            // and fences are not torn down while a dispatch could still be in flight.
+            _d3D12Device.Dispose();
+            _device.Dispose();
+        }
+        catch (Exception e)
         {
-            retired.Dispose();
+            Debug.WriteLine($"[HDR] resource disposal failed: {e}");
         }
-        _retiredSwapChains.Clear();
-        _swapChain.Dispose();
-        _dxgiFactory.Dispose();
-
-        // Release the reference we obtained on the underlying D3D12 device. The device itself
-        // is still owned by the ComputeSharp GraphicsDevice instance.
-        _d3D12Device.Dispose();
     }
 
     /// <summary>
