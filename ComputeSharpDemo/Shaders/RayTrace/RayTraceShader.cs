@@ -53,14 +53,7 @@ public readonly partial struct RayTraceShader(
     private static readonly Float3 S2A = new(0, 0, 0);
     private static readonly float S2P = 1.5f;
 
-    // Sphere 3 — glass inner bubble
-    private static readonly Float3 S3C = new(0, 1, -2.5f);
-    private static readonly float S3R = -0.92f;
-    private static readonly int S3T = 2;
-    private static readonly Float3 S3A = new(0.9f, 0.9f, 0.9f);
-    private static readonly float S3P = 1.5f;
-
-    // Sphere 4 — ground plane
+    // Sphere 3 — ground plane
     private static readonly Float3 S4C = new(0, -1000, 0);
     private static readonly float S4R = 1000.0f;
     private static readonly int S4T = 0;
@@ -75,7 +68,6 @@ public readonly partial struct RayTraceShader(
         if (HitSphere(ro, rd, S0C, S0R, tMin, tMax, out t, out n)) return true;
         if (HitSphere(ro, rd, S1C, S1R, tMin, tMax, out t, out n)) return true;
         if (HitSphere(ro, rd, S2C, S2R, tMin, tMax, out t, out n)) return true;
-        if (HitSphere(ro, rd, S3C, S3R, tMin, tMax, out t, out n)) return true;
         if (HitSphere(ro, rd, S4C, S4R, tMin, tMax, out t, out n)) return true;
 
         return false;
@@ -172,9 +164,6 @@ public readonly partial struct RayTraceShader(
 
         if (HitSphere(ro, rd, S2C, S2R, tMin, closest, out t, out n))
         { closest = t; hit = true; position = RayPointAt(ro, rd, t); normal = n; matType = S2T; matAlbedo = S2A; matParam = S2P; }
-
-        if (HitSphere(ro, rd, S3C, S3R, tMin, closest, out t, out n))
-        { closest = t; hit = true; position = RayPointAt(ro, rd, t); normal = n; matType = S3T; matAlbedo = S3A; matParam = S3P; }
 
         if (HitSphere(ro, rd, S4C, S4R, tMin, closest, out t, out n))
         { closest = t; hit = true; position = RayPointAt(ro, rd, t); normal = n; matType = S4T; matAlbedo = S4A; matParam = S4P; }
