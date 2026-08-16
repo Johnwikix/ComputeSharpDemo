@@ -60,6 +60,14 @@ public readonly partial struct RayTraceShader(
     private static readonly Float3 S4A = new(0.9f, 0.9f, 0.9f);
     private static readonly float S4P = 0;
 
+    // Prism — upright triangular glass prism for visible refraction
+    private static readonly Float3 PrismCenter = new(3.0f, 0.3464f, -2.5f);
+    private static readonly float PrismSide = 1.2f;
+    private static readonly float PrismDepth = 1.8f;
+    private static readonly float PrismAngle = 0.0f;
+    private static readonly int PrismT = 2;
+    private static readonly float PrismP = 1.52f;
+
     private static bool ShadowHit(Float3 ro, Float3 rd, float tMin, float tMax)
     {
         float t;
@@ -69,6 +77,9 @@ public readonly partial struct RayTraceShader(
         if (HitSphere(ro, rd, S1C, S1R, tMin, tMax, out t, out n)) return true;
         if (HitSphere(ro, rd, S2C, S2R, tMin, tMax, out t, out n)) return true;
         if (HitSphere(ro, rd, S4C, S4R, tMin, tMax, out t, out n)) return true;
+
+        Float3 p2;
+        if (HitPrism(ro, rd, tMin, out t, out p2, out n)) return true;
 
         return false;
     }
@@ -141,6 +152,104 @@ public readonly partial struct RayTraceShader(
         return true;
     }
 
+    private static Float3 RotateZ(Float3 v, float a)
+    {
+        float cosA = Hlsl.Cos(a);
+        float sinA = Hlsl.Sin(a);
+        return new Float3(cosA * v.X - sinA * v.Y, sinA * v.X + cosA * v.Y, v.Z);
+    }
+
+    private static bool PlaneHit(Float3 ro, Float3 rd, Float3 n, Float3 p0, float tMin, out float t)
+    {
+        t = 0;
+        float denom = Hlsl.Dot(rd, n);
+        if (Hlsl.Abs(denom) < 0.000001f)
+            return false;
+        t = Hlsl.Dot(p0 - ro, n) / denom;
+        return t > tMin;
+    }
+
+    private static bool InPrismTriangle(float x, float y, float halfSide, float h, float baseY)
+    {
+        if (y < baseY)
+            return false;
+        return y <= baseY + h * (1.0f - Hlsl.Abs(x) / halfSide);
+    }
+
+    // Triangular prism in local space: centroid at origin, extruded along Z.
+    // Works both from outside and from inside (returns min positive t).
+    private static bool HitPrism(Float3 ro, Float3 rd, float tMin,
+        out float hitT, out Float3 hitPos, out Float3 hitNormal)
+    {
+        hitT = 1000000.0f;
+        hitPos = Float3.Zero;
+        hitNormal = Float3.Zero;
+
+        float halfSide = PrismSide * 0.5f;
+        float halfDepth = PrismDepth * 0.5f;
+        float h = PrismSide * 0.8660254f;
+        float baseY = -h / 3.0f;
+
+        Float3 lro = RotateZ(ro - PrismCenter, -PrismAngle);
+        Float3 lrd = RotateZ(rd, -PrismAngle);
+
+        Float3 nBase = new Float3(0, -1, 0);
+        Float3 nLeft = new Float3(-h, halfSide, 0) / PrismSide;
+        Float3 nRight = new Float3(h, halfSide, 0) / PrismSide;
+
+        bool found = false;
+        float t;
+        Float3 p;
+        Float3 bestN = Float3.Zero;
+        Float3 bestP = Float3.Zero;
+
+        // Base face (y = baseY)
+        if (PlaneHit(lro, lrd, nBase, new Float3(0, baseY, 0), tMin, out t) && t < hitT)
+        {
+            p = lro + lrd * t;
+            if (p.X >= -halfSide && p.X <= halfSide && p.Z >= -halfDepth && p.Z <= halfDepth)
+            { found = true; hitT = t; bestN = nBase; bestP = p; }
+        }
+
+        // Left slant face (through A and apex C)
+        if (PlaneHit(lro, lrd, nLeft, new Float3(-halfSide, baseY, 0), tMin, out t) && t < hitT)
+        {
+            p = lro + lrd * t;
+            if (p.X >= -halfSide && p.X <= 0 && p.Z >= -halfDepth && p.Z <= halfDepth)
+            { found = true; hitT = t; bestN = nLeft; bestP = p; }
+        }
+
+        // Right slant face (through B and apex C)
+        if (PlaneHit(lro, lrd, nRight, new Float3(halfSide, baseY, 0), tMin, out t) && t < hitT)
+        {
+            p = lro + lrd * t;
+            if (p.X >= 0 && p.X <= halfSide && p.Z >= -halfDepth && p.Z <= halfDepth)
+            { found = true; hitT = t; bestN = nRight; bestP = p; }
+        }
+
+        // Cap faces
+        if (PlaneHit(lro, lrd, new Float3(0, 0, -1), new Float3(0, 0, -halfDepth), tMin, out t) && t < hitT)
+        {
+            p = lro + lrd * t;
+            if (InPrismTriangle(p.X, p.Y, halfSide, h, baseY))
+            { found = true; hitT = t; bestN = new Float3(0, 0, -1); bestP = p; }
+        }
+
+        if (PlaneHit(lro, lrd, new Float3(0, 0, 1), new Float3(0, 0, halfDepth), tMin, out t) && t < hitT)
+        {
+            p = lro + lrd * t;
+            if (InPrismTriangle(p.X, p.Y, halfSide, h, baseY))
+            { found = true; hitT = t; bestN = new Float3(0, 0, 1); bestP = p; }
+        }
+
+        if (!found)
+            return false;
+
+        hitPos = RotateZ(bestP, PrismAngle) + PrismCenter;
+        hitNormal = RotateZ(bestN, PrismAngle);
+        return true;
+    }
+
     private static bool HitScene(Float3 ro, Float3 rd, float tMin, float tMax,
         out Float3 position, out Float3 normal,
         out int matType, out Float3 matAlbedo, out float matParam)
@@ -167,6 +276,10 @@ public readonly partial struct RayTraceShader(
 
         if (HitSphere(ro, rd, S4C, S4R, tMin, closest, out t, out n))
         { closest = t; hit = true; position = RayPointAt(ro, rd, t); normal = n; matType = S4T; matAlbedo = S4A; matParam = S4P; }
+
+        Float3 p2;
+        if (HitPrism(ro, rd, tMin, out t, out p2, out n) && t < closest)
+        { closest = t; hit = true; position = p2; normal = n; matType = PrismT; matAlbedo = Float3.Zero; matParam = PrismP; }
 
         return hit;
     }

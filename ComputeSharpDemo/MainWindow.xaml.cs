@@ -46,7 +46,7 @@ public sealed partial class MainWindow : WindowEx
 
         // Populate shader selector
         ShaderSelector.ItemsSource = ShaderFactory.Catalog;
-        ShaderSelector.SelectedIndex = 0;
+        ShaderSelector.SelectedIndex = 1;
 
         // Mouse tracking
         _shaderPanel.PointerMoved += OnPointerMoved;
