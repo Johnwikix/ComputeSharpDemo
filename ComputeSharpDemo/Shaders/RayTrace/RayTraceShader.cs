@@ -9,15 +9,14 @@ public readonly partial struct RayTraceShader(
     Float2 iMouse,
     Float2 iResolution,
     int frame,
-    IReadWriteNormalizedTexture2D<Float4> previousFrame,
     float iDist,
     bool isHdrEnabled,
     float sdrWhiteLevelInNits,
-    float maxLuminanceInNits) : IComputeShader<Float4>
+    float maxLuminanceInNits,
+    IReadWriteNormalizedTexture2D<Float4> normalTexture) : IComputeShader<Float4>
 {
-    private const int MaxWeight = 100;
     private const int MaxBounces = 10;
-    private const int Samples = 4;
+    private const int Samples = 2;
 
     private const float PI = 3.14159265359f;
     private const float PI2 = 6.28318530717f;
@@ -346,6 +345,9 @@ public readonly partial struct RayTraceShader(
         uint rngState = (uint)(xy.X * 73856093 + xy.Y * 19349663 + (int)(iTime * 1000.0f) * 16777619 + frame * 83492791);
 
         Float3 color = Float3.Zero;
+        float hitDistEnc = 0;
+        Float3 primaryNormal = Float3.Zero;
+        float primaryMat = 3.0f;
 
         for (int s = 0; s < Samples; s++)
         {
@@ -356,6 +358,9 @@ public readonly partial struct RayTraceShader(
             Float3 position, normal, matAlbedo;
             int matType;
             float matParam;
+            float firstT = -1;
+            Float3 sampleNormal = Float3.Zero;
+            float sampleMat = 3.0f;
 
             // Inline trace loop
             Float3 rayRo = origin;
@@ -369,6 +374,13 @@ public readonly partial struct RayTraceShader(
                     out position, out normal,
                     out matType, out matAlbedo, out matParam))
                 {
+                    if (b == 0)
+                    {
+                        firstT = Hlsl.Length(position - rayRo);
+                        sampleNormal = normal;
+                        sampleMat = matType;
+                    }
+
                     float ndotl = Hlsl.Dot(normal, SunDir);
                     if (ndotl > 0.0f)
                     {
@@ -512,12 +524,21 @@ public readonly partial struct RayTraceShader(
             }
 
             color += accum;
+            hitDistEnc += firstT < 0 ? 1.0f : firstT / (firstT + 1.0f);
+
+            if (s == 0)
+            {
+                primaryNormal = sampleNormal;
+                primaryMat = sampleMat;
+            }
         }
 
         color /= Samples;
+        hitDistEnc /= Samples;
 
         // Encode the linear radiance for the current display: PQ for HDR10, sRGB gamma for SDR.
-        // The temporal accumulation below runs in the same (encoded) space as the previous frame.
+        // The denoiser pipeline (temporal accumulation + spatial filter) runs in this same
+        // encoded space, so the intermediate buffers can stay in a normalized UNORM format.
         if (isHdrEnabled)
         {
             Float3 nits = Hlsl.Min(color * sdrWhiteLevelInNits, maxLuminanceInNits);
@@ -529,13 +550,11 @@ public readonly partial struct RayTraceShader(
             color = Hlsl.Pow(Hlsl.Max(color, Float3.Zero), new Float3(1.0f / Gamma, 1.0f / Gamma, 1.0f / Gamma));
         }
 
-        Float4 previousColor = previousFrame[xy];
+        // World-space normal (RGB, stored as n*0.5+0.5) and material id (A) of the primary hit.
+        // Sky pixels store a zero normal and material id 3.
+        normalTexture[xy] = new Float4(primaryNormal * 0.5f + 0.5f, primaryMat);
 
-        float weight = frame < 1 ? 1.0f : Hlsl.Min((float)(frame + 1), (float)MaxWeight);
-
-        Float3 newColor = Hlsl.Lerp(previousColor.RGB, color, 1.0f / weight);
-
-        return new Float4(newColor, 1.0f);
+        return new Float4(color, hitDistEnc);
     }
 
     // ST 2084 (PQ) inverse EOTF, mapping linear luminance in nits to [0, 1] signal values
