@@ -162,6 +162,19 @@ public sealed class HdrShaderPanel : SwapChainPanel, IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
+        Dispose(null);
+    }
+
+    /// <summary>
+    /// Disposes the panel and its renderer.
+    /// </summary>
+    /// <param name="beforeDeviceDispose">
+    /// Optional callback invoked on the background teardown thread after the render thread has
+    /// stopped and the GPU is idle, but before the <see cref="GraphicsDevice"/> is disposed
+    /// (used to release runner resources that depend on the device).
+    /// </param>
+    public void Dispose(Action? beforeDeviceDispose)
+    {
         if (_disposed) return;
         _disposed = true;
 
@@ -169,6 +182,6 @@ public sealed class HdrShaderPanel : SwapChainPanel, IDisposable
         Unloaded -= OnUnloaded;
         SizeChanged -= OnSizeChanged;
 
-        _renderer.Dispose();
+        _renderer.Dispose(beforeDeviceDispose);
     }
 }

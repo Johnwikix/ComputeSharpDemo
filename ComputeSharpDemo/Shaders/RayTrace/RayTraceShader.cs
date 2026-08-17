@@ -16,7 +16,7 @@ public readonly partial struct RayTraceShader(
     IReadWriteNormalizedTexture2D<Float4> normalTexture) : IComputeShader<Float4>
 {
     private const int MaxBounces = 10;
-    private const int Samples = 2;
+    private const int Samples = 4;
 
     private const float PI = 3.14159265359f;
     private const float PI2 = 6.28318530717f;

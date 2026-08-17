@@ -28,6 +28,13 @@ public readonly partial struct SpatialFilterShader(
     /// <summary>Standard deviation of the hit-distance-difference Gaussian (relative distance).</summary>
     private const float DepthSigma = 0.7f;
 
+    /// <summary>
+    /// Strength of the NRD-style detail recovery: where the neighborhood disagrees (edges,
+    /// high-frequency detail) the filtered mean is unreliable, so a fraction of the unfiltered
+    /// center is blended back in to restore the sharpness lost to the blur.
+    /// </summary>
+    private const float DetailStrength = 0.45f;
+
     private static Float3 DecodeNormal(Float4 n)
     {
         return n.RGB * 2.0f - 1.0f;
@@ -135,6 +142,14 @@ public readonly partial struct SpatialFilterShader(
 
         Float3 mean = acc / wSum;
 
-        return new Float4(mean.X, mean.Y, mean.Z, c.W);
+        // Detail recovery: in fully agreeing neighborhoods (flat areas, sky, whose taps always
+        // carry weight 1) the filtered mean is kept as-is; where taps were rejected the detail
+        // term rises and part of the unfiltered center is restored, recovering edge sharpness.
+        float flat = Hlsl.Saturate((wSum - 1.0f) / 4.0f);
+        float detail = (1.0f - flat) * (1.0f - flat) * DetailStrength;
+
+        Float3 restored = mean + (c.RGB - mean) * detail;
+
+        return new Float4(restored.X, restored.Y, restored.Z, c.W);
     }
 }

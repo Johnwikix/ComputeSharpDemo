@@ -24,8 +24,12 @@ public readonly partial struct TemporalAccumulationShader(
     IReadWriteNormalizedTexture2D<Float4> signal,
     IReadWriteNormalizedTexture2D<Float4> history) : IComputeShader<Float4>
 {
-    /// <summary>Maximum number of frames the history is allowed to accumulate.</summary>
-    private const int MaxHistoryFrames = 32;
+    /// <summary>
+    /// Maximum number of frames the history is allowed to accumulate. Kept modest so the
+    /// current frame keeps a visible share of the output (sharpness); the spatial filter
+    /// supplies the remaining noise suppression.
+    /// </summary>
+    private const int MaxHistoryFrames = 12;
 
     /// <summary>Hit distance ratio tolerance before confidence collapses (NRD-style log2 distance).</summary>
     private const float ConfidenceSigma = 5.0f;

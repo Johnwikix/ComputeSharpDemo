@@ -74,6 +74,7 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     private IDXGISwapChain3 _swapChain = null!;
     private IDXGIFactory6 _dxgiFactory = null!;
     private IntPtr _frameLatencyWaitableObject;
+    private IntPtr _fenceEvent;
     private ISwapChainPanelNative* _swapChainPanelNative;
 
     /// <summary>
@@ -594,6 +595,9 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
             new DescriptorHeapDescription(DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, DescriptorHeapFlags.ShaderVisible, 0));
 
         _rtvIncrementSize = (int)_d3D12Device.GetDescriptorHandleIncrementSize(DescriptorHeapType.RenderTargetView);
+
+        // Event used by SignalAndWait() to actually block until the GPU is idle.
+        _fenceEvent = CreateEventW(IntPtr.Zero, false, false, null);
     }
 
     /// <summary>
@@ -891,12 +895,31 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
 
         if (_fence.CompletedValue < value)
         {
-            _fence.SetEventOnCompletion(value, IntPtr.Zero);
+            // A NULL event handle makes SetEventOnCompletion fail silently (the HRESULT used
+            // to be ignored), so this call returned without waiting and teardown could dispose
+            // GPU objects while work was still in flight. Also crashes dwm.exe, which keeps
+            // compositing the last-presented swap chain buffers of a torn-down device.
+            _fence.SetEventOnCompletion(value, _fenceEvent).CheckError();
+
+            WaitForSingleObjectEx(_fenceEvent, InfiniteWait, true);
         }
     }
 
     /// <inheritdoc/>
     public void Dispose()
+    {
+        Dispose(null);
+    }
+
+    /// <summary>
+    /// Disposes the renderer.
+    /// </summary>
+    /// <param name="beforeDeviceDispose">
+    /// Optional callback invoked on the background teardown thread after the render thread has
+    /// stopped and the GPU is idle, but before the underlying D3D12 device is disposed (used
+    /// to release runner resources that depend on the device).
+    /// </param>
+    public void Dispose(Action? beforeDeviceDispose)
     {
         if (_disposed) return;
         _disposed = true;
@@ -927,13 +950,18 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
         // Phase 2 (background thread): all blocking teardown — render thread join, GPU
         // drain and swap chain disposal can take seconds (compositor retirement, large
         // shader dispatches), so closing the window must not block on them.
-        ThreadPool.QueueUserWorkItem(static state => ((HdrSwapChainRenderer)state!).DisposeResources());
+        ThreadPool.QueueUserWorkItem(_ => DisposeResources(beforeDeviceDispose));
     }
 
     /// <summary>
     /// Performs the blocking part of the disposal on a background thread.
     /// </summary>
-    private void DisposeResources()
+    /// <param name="beforeDeviceDispose">
+    /// Optional callback invoked after the render thread has stopped and the GPU is idle,
+    /// but before the underlying D3D12 device is disposed (used to release resources that
+    /// depend on the device, such as the pass textures).
+    /// </param>
+    private void DisposeResources(Action? beforeDeviceDispose)
     {
         try
         {
@@ -943,6 +971,14 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
             StopRenderLoop();
 
             SignalAndWait();
+
+            // Drain the composition pipeline: wait for DWM to retire the last-presented back
+            // buffers before they and the swap chains are released below. Releasing them while
+            // the compositor still references them tears down the device under dwm.exe.
+            for (int i = 0; i < 2 && _frameLatencyWaitableObject != IntPtr.Zero; i++)
+            {
+                WaitForSingleObjectEx(_frameLatencyWaitableObject, 1000, true);
+            }
 
             for (int i = 0; i < _backBuffers.Length; i++)
             {
@@ -966,12 +1002,22 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
             _swapChain.Dispose();
             _dxgiFactory.Dispose();
 
+            // Release the runner-owned resources (pass textures) while the render thread is
+            // stopped and the GPU is idle, but before the D3D12 device is torn down.
+            beforeDeviceDispose?.Invoke();
+
             // Release the reference we obtained on the underlying D3D12 device. The device
             // itself is owned by the ComputeSharp GraphicsDevice instance, which is disposed
             // here as well — it must happen after the render thread has exited so its queues
             // and fences are not torn down while a dispatch could still be in flight.
             _d3D12Device.Dispose();
             _device.Dispose();
+
+            if (_fenceEvent != IntPtr.Zero)
+            {
+                CloseHandle(_fenceEvent);
+                _fenceEvent = IntPtr.Zero;
+            }
         }
         catch (Exception e)
         {
@@ -993,6 +1039,12 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint WaitForSingleObjectEx(IntPtr hObject, uint dwMilliseconds, bool bAlertable);
+
+    [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "CreateEventW")]
+    private static extern IntPtr CreateEventW(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, string? lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
 }
 
 /// <summary>

@@ -387,12 +387,15 @@ public sealed partial class MainWindow : WindowEx
 
         AppWindow.Changed -= OnAppWindowChanged;
 
-        _shaderPanel.Dispose();
-        _factory.Dispose();
-        _hdrTracker?.Dispose();
+        // Pass resources and the HDR tracker are released by the renderer's background
+        // teardown: after the render thread has exited and the GPU is idle, but before
+        // the GraphicsDevice itself is disposed (it is disposed by the renderer, last).
+        _shaderPanel.Dispose(() =>
+        {
+            _factory.Dispose();
+            _hdrTracker?.Dispose();
+        });
 
-        // Note: the GraphicsDevice is disposed by the renderer's background disposal
-        // (it must happen after the render thread has exited).
         _stopwatch.Stop();
     }
 }
