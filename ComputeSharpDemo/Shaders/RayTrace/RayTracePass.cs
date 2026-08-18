@@ -43,7 +43,6 @@ public sealed class RayTracePass : IShaderPass
     private Float2 _mouse;
     private float _dist = 6.5f;
     private int _frame;
-    private int _totalFrames;
     private bool _disposed;
 
     private int _textureWidth;
@@ -129,8 +128,6 @@ public sealed class RayTracePass : IShaderPass
         ShaderCapabilities.UsesTime
       | ShaderCapabilities.UsesMouse
       | ShaderCapabilities.UsesResolution;
-
-    public int TotalFrames => _totalFrames;
 
     public void SetMouse(float x, float y, float panelWidth, float panelHeight)
     {
@@ -263,7 +260,6 @@ public sealed class RayTracePass : IShaderPass
         }
 
         _frame++;
-        _totalFrames++;
 
         return true;
     }

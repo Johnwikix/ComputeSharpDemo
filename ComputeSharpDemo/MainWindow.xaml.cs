@@ -21,7 +21,6 @@ public sealed partial class MainWindow : WindowEx
     private HdrShaderPanel _shaderPanel = null!;
     private HdrDisplayInfoTracker? _hdrTracker;
     private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
-    private int _fpsBaseline;
     private IShaderPass? _activePass;
     private bool _hdrAutoEnabled;
     private bool _hdrDetectionInitialized;
@@ -62,18 +61,10 @@ public sealed partial class MainWindow : WindowEx
         // (multi-monitor setups with mixed HDR/SDR outputs).
         AppWindow.Changed += OnAppWindowChanged;
 
-        // FPS counter (poll pass frame count every 500ms) + safety-net output recheck
-        var fpsTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
-        fpsTimer.Tick += (_, _) =>
-        {
-            int total = _activePass?.TotalFrames ?? 0;
-            int fps = (int)((total - _fpsBaseline) / 0.5);
-            FrameCountText.Text = $"FPS: {fps}";
-            _fpsBaseline = total;
-
-            UpdateWindowBoundsAndRecheckOutput();
-        };
-        fpsTimer.Start();
+        // Safety-net output recheck (HDR state can change without a window event)
+        var recheckTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+        recheckTimer.Tick += (_, _) => UpdateWindowBoundsAndRecheckOutput();
+        recheckTimer.Start();
 
         // HDR detection is deferred until the window is activated: DisplayInformation
         // is not reliably available while the window is still being constructed.
@@ -438,8 +429,6 @@ public sealed partial class MainWindow : WindowEx
     {
         // Do NOT clear the shader runner: the render loop is resilient to transient
         // errors (resizes, presents), so a single failure must not stop rendering.
-        FrameCountText.Text = "渲染错误";
-
         Debug.WriteLine($"Rendering failed: {e}");
     }
 

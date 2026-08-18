@@ -40,9 +40,4 @@ public interface IHdrShaderRunner
     /// <param name="parameter">A <see cref="HdrRenderParameters"/> value controlling the output encoding.</param>
     /// <returns>Whether a frame was produced and should be presented.</returns>
     bool TryExecute(ReadWriteTexture2D<Rgba64, Float4> texture, int width, int height, TimeSpan timespan, object? parameter);
-
-    /// <summary>
-    /// Gets the monotonically increasing frame counter (used for the FPS display).
-    /// </summary>
-    int TotalFrames { get; }
 }
