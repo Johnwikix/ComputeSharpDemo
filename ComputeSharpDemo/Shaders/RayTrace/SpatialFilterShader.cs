@@ -3,37 +3,49 @@ using ComputeSharp;
 namespace ComputeSharpDemo.Shaders.RayTrace;
 
 /// <summary>
-/// NRD-style spatial filtering pass: one level of an A-trous wavelet filter with
-/// cross-bilateral (edge-avoiding) weights. The kernel is dispatched twice with an
-/// increasing <c>step</c> (1, then 2), ping-ponging between two buffers.
+/// SVGF-style spatial filtering pass: one level of an A-trous wavelet filter with a 3x3 box
+/// kernel (as used in the GDC 2019 "Real-Time Path Tracing and Denoising in Quake II" talk).
+/// The pass is dispatched five times per frame with an increasing <c>level</c> (0..4, step
+/// 1, 2, 4, 8, 16), ping-ponging between two buffers; the combined support reaches 33x33
+/// pixels. The last level filters straight into the display texture.
 ///
-/// Edge stopping uses the NRD guide signals:
+/// <paramref name="signalIn"/> carries the color in RGB and the per-pixel variance estimate
+/// in W (written by <see cref="TemporalAccumulationShader"/>); the variance is filtered with
+/// the same weights, so converged (low-variance) pixels end up almost unblurred while noisy
+/// ones get the full kernel — SVGF's "temporally stable -&gt; blur less" behavior.
+///
+/// Edge stopping combines the NRD guide signals:
 ///   - world-space normals (stored in <paramref name="normalTexture"/>.RGB)
-///   - normalized hit distance (signal W channel, decoded back to meters here)
+///   - hit distance (read from the current frame's <paramref name="signalDistance"/>.W,
+///     decoded back to meters here), whose tolerance grows with the level
 ///   - material id (stored in <paramref name="normalTexture"/>.W) as a hard edge stop
+///   - a variance-guided luminance weight: <c>exp(-|l0 - l1| / (sigma * sqrt(var)))</c>.
 ///
-/// Sky pixels carry a zero normal + material id 3 and filter among themselves only.
+/// Sky pixels carry a zero normal + material id 3 and filter among themselves using the
+/// luminance weight only (the sun disk stays protected, depth is infinite for sky).
 /// </summary>
 [ThreadGroupSize(DefaultThreadGroupSizes.XY)]
 [GeneratedComputeShaderDescriptor]
 public readonly partial struct SpatialFilterShader(
-    int step,
+    int level,
     Float2 iResolution,
     IReadWriteNormalizedTexture2D<Float4> signalIn,
+    IReadWriteNormalizedTexture2D<Float4> signalDistance,
     IReadWriteNormalizedTexture2D<Float4> normalTexture) : IComputeShader<Float4>
 {
     /// <summary>Standard deviation of the normal-difference Gaussian (1 - |dot(n0, n1)|).</summary>
     private const float NormalSigma = 0.15f;
 
-    /// <summary>Standard deviation of the hit-distance-difference Gaussian (relative distance).</summary>
+    /// <summary>Base standard deviation of the hit-distance-difference weight.</summary>
     private const float DepthSigma = 0.7f;
 
-    /// <summary>
-    /// Strength of the NRD-style detail recovery: where the neighborhood disagrees (edges,
-    /// high-frequency detail) the filtered mean is unreliable, so a fraction of the unfiltered
-    /// center is blended back in to restore the sharpness lost to the blur.
-    /// </summary>
-    private const float DetailStrength = 0.45f;
+    /// <summary>Scale of the variance-normalized luminance edge-stopping weight (SVGF sigma_l).</summary>
+    private const float LuminanceSigma = 1.0f;
+
+    private static float Luminance(Float3 c)
+    {
+        return 0.2126f * c.X + 0.7152f * c.Y + 0.0722f * c.Z;
+    }
 
     private static Float3 DecodeNormal(Float4 n)
     {
@@ -50,106 +62,92 @@ public readonly partial struct SpatialFilterShader(
         return enc / (1.0f - enc);
     }
 
-    private static float ComputeWeight(Float3 n0, float t0, float m0, Float3 n1, float t1, float m1)
+    private static float ComputeWeight(
+        Float3 n0, float t0, int m0, float l0, float var0,
+        Float3 n1, float t1, int m1, float l1, float depthSigma)
     {
         bool sky0 = IsSky(n0);
         bool sky1 = IsSky(n1);
-
-        if (sky0 && sky1)
-        {
-            return 1.0f;
-        }
 
         if (sky0 != sky1 || m0 != m1)
         {
             return 0.0f;
         }
 
+        float wL = Hlsl.Exp(-Hlsl.Abs(l0 - l1) / (LuminanceSigma * Hlsl.Sqrt(var0) + 1e-4f));
+
+        if (sky0 && sky1)
+        {
+            return wL;
+        }
+
         float normalDiff = 1.0f - Hlsl.Dot(n0, n1);
         float depthDiff = Hlsl.Abs(t1 - t0) / Hlsl.Max(t0, 0.5f);
 
         float wN = Hlsl.Exp(-(normalDiff * normalDiff) / (2.0f * NormalSigma * NormalSigma));
-        float wT = Hlsl.Exp(-(depthDiff * depthDiff) / (2.0f * DepthSigma * DepthSigma));
+        float wD = Hlsl.Exp(-depthDiff / depthSigma);
 
-        return wN * wT;
+        return wN * wD * wL;
     }
 
     public Float4 Execute()
     {
+        int step = (int)(1U << level);
+        float depthSigma = DepthSigma * Hlsl.Pow(1.5f, level);
+
         Int2 xy = ThreadIds.XY;
 
         Float4 c = signalIn[xy];
+        float t0 = ToMeters(signalDistance[xy].W);
         Float4 n4 = normalTexture[xy];
 
         Float3 n0 = DecodeNormal(n4);
-        float t0 = ToMeters(c.W);
-        float m0 = n4.W;
+        int m0 = (int)n4.W;
+        float l0 = Luminance(c.RGB);
+        float var0 = Hlsl.Max(c.W, 1e-4f);
 
+        // 3x3 box kernel (A-trous with the given step). The center tap always carries
+        // weight 1, so the result falls back to the unfiltered pixel when every
+        // neighborhood tap is rejected.
         Float3 acc = c.RGB;
+        float vAcc = var0;
         float wSum = 1.0f;
 
-        // A-trous taps on the 4 diagonals — with two levels (step 1, 2) the combined
-        // support covers a 5x5 neighborhood like NRD's early RELAX iterations.
-        Int2 p1 = new Int2(xy.X + step, xy.Y + step);
-        Int2 p2 = new Int2(xy.X + step, xy.Y - step);
-        Int2 p3 = new Int2(xy.X - step, xy.Y + step);
-        Int2 p4 = new Int2(xy.X - step, xy.Y - step);
-
-        Float4 t;
-        Float4 n;
-        float w;
-        Int2 p;
-
-        p = p1;
-        if (p.X >= 0 && p.X < iResolution.X && p.Y >= 0 && p.Y < iResolution.Y)
+        for (int oy = -1; oy <= 1; oy++)
         {
-            t = signalIn[p];
-            n = normalTexture[p];
-            w = ComputeWeight(n0, t0, m0, DecodeNormal(n), ToMeters(t.W), n.W);
-            acc += t.RGB * w;
-            wSum += w;
-        }
+            for (int ox = -1; ox <= 1; ox++)
+            {
+                if (ox == 0 && oy == 0)
+                {
+                    continue;
+                }
 
-        p = p2;
-        if (p.X >= 0 && p.X < iResolution.X && p.Y >= 0 && p.Y < iResolution.Y)
-        {
-            t = signalIn[p];
-            n = normalTexture[p];
-            w = ComputeWeight(n0, t0, m0, DecodeNormal(n), ToMeters(t.W), n.W);
-            acc += t.RGB * w;
-            wSum += w;
-        }
+                Int2 p = new(xy.X + ox * step, xy.Y + oy * step);
 
-        p = p3;
-        if (p.X >= 0 && p.X < iResolution.X && p.Y >= 0 && p.Y < iResolution.Y)
-        {
-            t = signalIn[p];
-            n = normalTexture[p];
-            w = ComputeWeight(n0, t0, m0, DecodeNormal(n), ToMeters(t.W), n.W);
-            acc += t.RGB * w;
-            wSum += w;
-        }
+                if (p.X < 0 || p.X >= iResolution.X || p.Y < 0 || p.Y >= iResolution.Y)
+                {
+                    continue;
+                }
 
-        p = p4;
-        if (p.X >= 0 && p.X < iResolution.X && p.Y >= 0 && p.Y < iResolution.Y)
-        {
-            t = signalIn[p];
-            n = normalTexture[p];
-            w = ComputeWeight(n0, t0, m0, DecodeNormal(n), ToMeters(t.W), n.W);
-            acc += t.RGB * w;
-            wSum += w;
+                Float4 tap = signalIn[p];
+                Float4 tn = normalTexture[p];
+
+                float w = ComputeWeight(
+                    n0, t0, m0, l0, var0,
+                    DecodeNormal(tn), ToMeters(signalDistance[p].W), (int)tn.W, Luminance(tap.RGB), depthSigma);
+
+                acc += tap.RGB * w;
+                vAcc += tap.W * w;
+                wSum += w;
+            }
         }
 
         Float3 mean = acc / wSum;
 
-        // Detail recovery: in fully agreeing neighborhoods (flat areas, sky, whose taps always
-        // carry weight 1) the filtered mean is kept as-is; where taps were rejected the detail
-        // term rises and part of the unfiltered center is restored, recovering edge sharpness.
-        float flat = Hlsl.Saturate((wSum - 1.0f) / 4.0f);
-        float detail = (1.0f - flat) * (1.0f - flat) * DetailStrength;
+        // Filter the variance with the same kernel so higher levels see a cleaner estimate
+        // (SVGF), narrowing the blur as the image converges.
+        float meanVar = vAcc / wSum;
 
-        Float3 restored = mean + (c.RGB - mean) * detail;
-
-        return new Float4(restored.X, restored.Y, restored.Z, c.W);
+        return new Float4(mean.X, mean.Y, mean.Z, meanVar);
     }
 }

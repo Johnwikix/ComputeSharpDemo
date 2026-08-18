@@ -1,7 +1,9 @@
 using ComputeSharp;
 using ComputeSharpDemo.Hdr;
 using ComputeSharpDemo.Shaders;
+using ComputeSharpDemo.Shaders.RayTrace;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using System.Diagnostics;
 using Microsoft.UI.Windowing;
@@ -25,6 +27,7 @@ public sealed partial class MainWindow : WindowEx
     private bool _hdrDetectionInitialized;
     private bool _layoutInitialized;
     private bool _disposed;
+    private bool _syncingRayTraceParams;
 
     // XAML sizes are in DIPs; the swap chain / render target must be physical pixels.
     private double DpiScale => RootGrid.XamlRoot?.RasterizationScale ?? 1.0;
@@ -142,6 +145,60 @@ public sealed partial class MainWindow : WindowEx
         _activePass = pass;
 
         AuthorText.Text = info.DisplayName;
+
+        if (pass is RayTracePass rayTracePass)
+        {
+            SyncRayTraceParams(rayTracePass);
+        }
+        else
+        {
+            RayTraceParamBar.Visibility = Visibility.Collapsed;
+        }
+
+        // The parameter bar visibility changes the canvas slot height without resizing
+        // RootGrid itself, so re-sync the panel/buffer once the pending layout pass has
+        // updated the row heights.
+        DispatcherQueue.TryEnqueue(() => SafeTry(TrySyncPanelAndBuffer));
+    }
+
+    // Populates the ray-trace parameter bar from the pass state. The sync flag keeps the
+    // control change handlers from writing back (and resetting the frame counter) while
+    // the controls are being initialized.
+    private void SyncRayTraceParams(RayTracePass pass)
+    {
+        _syncingRayTraceParams = true;
+        try
+        {
+            RayTraceParamBar.Visibility = Visibility.Visible;
+            DenoiserSelector.SelectedIndex = (int)pass.DenoiserMode;
+            MaxBouncesBox.Value = pass.MaxBounces;
+            SamplesBox.Value = pass.Samples;
+        }
+        finally
+        {
+            _syncingRayTraceParams = false;
+        }
+    }
+
+    private void OnDenoiserSelected(object sender, Microsoft.UI.Xaml.Controls.SelectionChangedEventArgs e)
+    {
+        if (_syncingRayTraceParams || _activePass is not RayTracePass pass) return;
+
+        pass.DenoiserMode = (RayTraceDenoiserMode)DenoiserSelector.SelectedIndex;
+    }
+
+    private void OnMaxBouncesChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (_syncingRayTraceParams || _activePass is not RayTracePass pass || double.IsNaN(args.NewValue)) return;
+
+        pass.MaxBounces = (int)Math.Round(args.NewValue);
+    }
+
+    private void OnSamplesChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (_syncingRayTraceParams || _activePass is not RayTracePass pass || double.IsNaN(args.NewValue)) return;
+
+        pass.Samples = (int)Math.Round(args.NewValue);
     }
 
     private void OnPointerMoved(object sender, PointerRoutedEventArgs e)
@@ -343,9 +400,20 @@ public sealed partial class MainWindow : WindowEx
         });
     }
 
-    private double ToolbarHeight => RootGrid.RowDefinitions.Count > 0
-        ? RootGrid.RowDefinitions[0].ActualHeight
-        : 0;
+    private double ToolbarHeight
+    {
+        get
+        {
+            double total = 0;
+            var rows = RootGrid.RowDefinitions;
+            for (int i = 0; i < rows.Count - 1; i++)
+            {
+                total += rows[i].ActualHeight;
+            }
+
+            return total;
+        }
+    }
 
     // Keeps the current-output HDR state in sync with the window position (multi-monitor).
     private void UpdateWindowBoundsAndRecheckOutput()

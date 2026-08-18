@@ -13,11 +13,10 @@ public readonly partial struct RayTraceShader(
     bool isHdrEnabled,
     float sdrWhiteLevelInNits,
     float maxLuminanceInNits,
+    int maxBounces,
+    int samples,
     IReadWriteNormalizedTexture2D<Float4> normalTexture) : IComputeShader<Float4>
 {
-    private const int MaxBounces = 10;
-    private const int Samples = 1;
-
     private const float PI = 3.14159265359f;
     private const float PI2 = 6.28318530717f;
 
@@ -349,7 +348,7 @@ public readonly partial struct RayTraceShader(
         Float3 primaryNormal = Float3.Zero;
         float primaryMat = 3.0f;
 
-        for (int s = 0; s < Samples; s++)
+        for (int s = 0; s < samples; s++)
         {
             Float3 dir = lowerLeft - origin;
             dir += Scale(horizontal, pixelSize.X * Random(ref rngState) + uv.X);
@@ -368,7 +367,7 @@ public readonly partial struct RayTraceShader(
             Float3 accum = Float3.Zero;
             Float3 mask = new(1.0f, 1.0f, 1.0f);
 
-            for (int b = 0; b < MaxBounces; b++)
+            for (int b = 0; b < maxBounces; b++)
             {
                 if (HitScene(rayRo, rayRd, 0.001f, 5000.0f,
                     out position, out normal,
@@ -533,8 +532,8 @@ public readonly partial struct RayTraceShader(
             }
         }
 
-        color /= Samples;
-        hitDistEnc /= Samples;
+        color /= samples;
+        hitDistEnc /= samples;
 
         // Encode the linear radiance for the current display: PQ for HDR10, sRGB gamma for SDR.
         // The denoiser pipeline (temporal accumulation + spatial filter) runs in this same

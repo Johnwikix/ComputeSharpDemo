@@ -18,7 +18,7 @@
     <Grid
         x:Name="RootGrid"
         Margin="0,32,0,0"
-        RowDefinitions="Auto,*"
+        RowDefinitions="Auto,Auto,*"
         SizeChanged="OnRootGridSizeChanged">
         <!--  Toolbar  -->
         <Grid
@@ -62,12 +62,72 @@
                 Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
         </Grid>
 
+        <!--  Ray-trace parameter bar (visible only while the Ray Trace shader is active)  -->
+        <Grid
+            x:Name="RayTraceParamBar"
+            Grid.Row="1"
+            Margin="12,0,12,8"
+            ColumnDefinitions="Auto,Auto,Auto,Auto,Auto,Auto"
+            Visibility="Collapsed">
+            <TextBlock
+                Grid.Column="0"
+                Margin="0,0,8,0"
+                VerticalAlignment="Center"
+                Text="降噪器"
+                FontSize="13"
+                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            <ComboBox
+                x:Name="DenoiserSelector"
+                Grid.Column="1"
+                MinWidth="140"
+                VerticalAlignment="Center"
+                SelectionChanged="OnDenoiserSelected">
+                <ComboBoxItem Content="无" />
+                <ComboBoxItem Content="时域均值累加" />
+                <ComboBoxItem Content="RELAX" />
+            </ComboBox>
+            <TextBlock
+                Grid.Column="2"
+                Margin="16,0,8,0"
+                VerticalAlignment="Center"
+                Text="MaxBounces"
+                FontSize="13"
+                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            <NumberBox
+                x:Name="MaxBouncesBox"
+                Grid.Column="3"
+                Width="90"
+                VerticalAlignment="Center"
+                Minimum="1"
+                Maximum="32"
+                SmallChange="1"
+                SpinButtonPlacementMode="Compact"
+                ValueChanged="OnMaxBouncesChanged" />
+            <TextBlock
+                Grid.Column="4"
+                Margin="16,0,8,0"
+                VerticalAlignment="Center"
+                Text="Samples"
+                FontSize="13"
+                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            <NumberBox
+                x:Name="SamplesBox"
+                Grid.Column="5"
+                Width="90"
+                VerticalAlignment="Center"
+                Minimum="1"
+                Maximum="16"
+                SmallChange="1"
+                SpinButtonPlacementMode="Compact"
+                ValueChanged="OnSamplesChanged" />
+        </Grid>
+
         <!--
             GPU surface. SwapChainPanel displays swapchain buffer pixels as DIPs
             (WinUI bug #8219): the host is sized to the physical pixel size so the
             full buffer is visible, and the panel is counter-scaled by 1/DpiScale
             to fit the layout again (the panel itself always arranges at its slot size).
         -->
-        <Canvas x:Name="PanelHost" Grid.Row="1" />
+        <Canvas x:Name="PanelHost" Grid.Row="2" />
     </Grid>
 </winex:WindowEx>
