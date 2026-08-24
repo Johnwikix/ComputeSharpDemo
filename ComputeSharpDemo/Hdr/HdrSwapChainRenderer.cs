@@ -43,14 +43,6 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     private const uint ResizePollIntervalMs = 100;
 
     /// <summary>
-    /// How long a new size must remain unchanged before it is applied to the swap chain.
-    /// During window drags resize events arrive continuously; coalescing them avoids
-    /// resize storms and guarantees at least one present between two ResizeBuffers calls
-    /// (DXGI rejects back-to-back resizes without an intermediate present).
-    /// </summary>
-    private const long ResizeSettleIntervalMs = 30;
-
-    /// <summary>
     /// Backoff between resize retries after a transient failure.
     /// </summary>
     private const long ResizeRetryIntervalMs = 500;
@@ -101,7 +93,6 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     private volatile float _width = 1;
     private volatile float _height = 1;
     private volatile bool _presentedSinceResize = true;
-    private long _resizeQueuedAt;
     private long _resizeRetryAt;
     private volatile bool _hdrMode;
     private volatile bool _colorSpaceApplied;
@@ -384,15 +375,13 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     }
 
     /// <summary>
-    /// Queues a resize of the render surface. Applies on the render thread once the size
-    /// has been stable for <see cref="ResizeSettleIntervalMs"/> (see
-    /// <see cref="TryApplyPendingResize"/>).
+    /// Queues a resize of the render surface. Applies on the render thread at the next
+    /// present opportunity (see <see cref="TryApplyPendingResize"/>).
     /// </summary>
     public void QueueResize(double width, double height)
     {
         _width = (float)Math.Max(width, 1);
         _height = (float)Math.Max(height, 1);
-        _resizeQueuedAt = Environment.TickCount64;
         _isResizePending = true;
     }
 
@@ -519,10 +508,10 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     }
 
     /// <summary>
-    /// Applies a pending resize once the requested size has been stable for
-    /// <see cref="ResizeSettleIntervalMs"/>. Coalescing rapid resize events (e.g. during a
-    /// window drag) also guarantees that consecutive <c>ResizeBuffers</c> calls are always
-    /// separated by at least one present, which DXGI requires for flip-model swap chains.
+    /// Applies a pending resize at the next present opportunity. The only gating constraint
+    /// is the DXGI flip-model requirement that consecutive <c>ResizeBuffers</c> calls are
+    /// separated by at least one present; rapid resize events simply update the pending size,
+    /// which coalesces naturally into one apply per present.
     /// </summary>
     /// <returns>Whether a resize was applied by this call.</returns>
     private bool TryApplyPendingResize()
@@ -540,15 +529,8 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
             blocked = "no-present-since-resize";
         }
 
-        long now = Environment.TickCount64;
-
-        // Wait for the size to settle, and back off after a previous failure.
-        if (blocked is null && now - _resizeQueuedAt < ResizeSettleIntervalMs)
-        {
-            blocked = "settling";
-        }
-
-        if (blocked is null && now < _resizeRetryAt)
+        // Back off after a previous failure.
+        if (blocked is null && Environment.TickCount64 < _resizeRetryAt)
         {
             blocked = "backoff";
         }
@@ -690,6 +672,12 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
 
                 _frameLatencyWaitableObject = _swapChain.FrameLatencyWaitableObject;
 
+                // Fill the first back buffer with the last rendered frame and present it once,
+                // so the compositor samples real content instead of the new chain's undefined
+                // back buffers (which would show as a black flash) before the render thread's
+                // first present.
+                FillNewChainWithLastFrame((int)width, (int)height);
+
                 // The new chain starts in SDR: the color space is re-applied after its first present.
                 _colorSpaceApplied = false;
 
@@ -723,6 +711,75 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
         }
 
         return swapped;
+    }
+
+    /// <summary>
+    /// Blits the last rendered frame into buffer 0 of the (already bound) new swap chain and
+    /// presents it once, so the compositor samples real content instead of the new chain's
+    /// undefined back buffers before the render thread issues its first present. Runs on the
+    /// UI thread inside <see cref="ReplaceSwapChain"/> while the render thread is blocked in
+    /// <c>done.Wait()</c>, so the command list is not contended and the GPU is idle
+    /// (<see cref="ApplyResize"/> drains it before replacing the chain). On failure the chain
+    /// stays bound and the previous behavior (brief undefined content) applies.
+    /// </summary>
+    private void FillNewChainWithLastFrame(int width, int height)
+    {
+        // Nothing to blit on the very first resize (no frame has been rendered yet).
+        if (_frameResource is null)
+        {
+            return;
+        }
+
+        ID3D12Resource? backBuffer = null;
+
+        try
+        {
+            backBuffer = _swapChain.GetBuffer<ID3D12Resource>(0);
+
+            // Heap slot 0 still references the retired chain's (disposed) back buffer: recreate
+            // the RTV for the new chain. ApplyResize recreates both slots right afterwards.
+            CpuDescriptorHandle rtvHandle = _rtvHeap.GetCPUDescriptorHandleForHeapStart();
+            _d3D12Device.CreateRenderTargetView(backBuffer, null, rtvHandle);
+
+            _commandAllocator.Reset();
+            _commandList.Reset(_commandAllocator, null);
+
+            _commandList.ResourceBarrierTransition(
+                _frameResource, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource, AllSubresources, ResourceBarrierFlags.None);
+
+            _commandList.ResourceBarrierTransition(
+                backBuffer, ResourceStates.Common, ResourceStates.RenderTarget, AllSubresources, ResourceBarrierFlags.None);
+
+            _commandList.SetDescriptorHeaps(_srvHeap);
+            _commandList.SetGraphicsRootSignature(_fullScreenPass.RootSignature);
+            _commandList.SetGraphicsRootDescriptorTable(0, _srvHeap.GetGPUDescriptorHandleForHeapStart());
+            _commandList.OMSetRenderTargets(rtvHandle, null);
+            _commandList.RSSetViewport(0, 0, width, height, 0, 1);
+            _commandList.RSSetScissorRect(width, height);
+            _commandList.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            _commandList.SetPipelineState(_fullScreenPass.PipelineState);
+            _commandList.DrawInstanced(3, 1, 0, 0);
+
+            _commandList.ResourceBarrierTransition(
+                _frameResource, ResourceStates.PixelShaderResource, ResourceStates.UnorderedAccess, AllSubresources, ResourceBarrierFlags.None);
+
+            _commandList.ResourceBarrierTransition(
+                backBuffer, ResourceStates.RenderTarget, ResourceStates.Common, AllSubresources, ResourceBarrierFlags.None);
+
+            _commandList.Close();
+
+            _commandQueue.ExecuteCommandLists(new ID3D12CommandList[] { _commandList });
+
+            _swapChain.Present(0, PresentFlags.None);
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"[HDR] First-frame fill failed: {e}");
+        }
+        finally
+        {
+            backBuffer?.Dispose();
+        }
     }
 
     /// <summary>
