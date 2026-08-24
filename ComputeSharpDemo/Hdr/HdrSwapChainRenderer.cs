@@ -37,10 +37,10 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     private const uint InfiniteWait = 0xFFFFFFFF;
 
     /// <summary>
-    /// Maximum wait for the frame-latency waitable object before re-checking for a pending
-    /// resize (bounds the wait so the render loop always stays responsive to UI changes).
+    /// Number of frames kept in flight (ring depth). Paces the render loop purely by GPU
+    /// completion with a small pipeline headroom — never by the display refresh rate.
     /// </summary>
-    private const uint ResizePollIntervalMs = 100;
+    private const int MaxFramesInFlight = 2;
 
     /// <summary>
     /// Backoff between resize retries after a transient failure.
@@ -61,9 +61,10 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     private ID3D12Device _d3D12Device = null!;
     private ID3D12CommandQueue _commandQueue = null!;
     private ID3D12Fence _fence = null!;
-    private ID3D12CommandAllocator _commandAllocator = null!;
-    private ID3D12GraphicsCommandList _commandList = null!;
+    private readonly ID3D12CommandAllocator[] _commandAllocators = new ID3D12CommandAllocator[MaxFramesInFlight];
+    private readonly ID3D12GraphicsCommandList[] _commandLists = new ID3D12GraphicsCommandList[MaxFramesInFlight];
     private IDXGISwapChain3 _swapChain = null!;
+    private bool _allowTearing;
     private IDXGIFactory6 _dxgiFactory = null!;
     private IntPtr _frameLatencyWaitableObject;
     private IntPtr _fenceEvent;
@@ -83,11 +84,15 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     private HdrFullScreenPass _fullScreenPass = null!;
     private ID3D12DescriptorHeap _rtvHeap = null!;
     private ID3D12DescriptorHeap _srvHeap = null!;
+    private ID3D12DescriptorHeap _fillSrvHeap = null!;
     private int _rtvIncrementSize;
+    private int _srvIncrementSize;
     private readonly ID3D12Resource[] _backBuffers = new ID3D12Resource[2];
 
-    private ReadWriteTexture2D<Rgba64, Float4>? _frameBuffer;
-    private ID3D12Resource? _frameResource;
+    // One frame texture + SRV per ring slot: in-flight frames must never share a texture
+    // (a later dispatch would overwrite it while an earlier pass is still reading it).
+    private readonly ReadWriteTexture2D<Rgba64, Float4>?[] _frameBuffers = new ReadWriteTexture2D<Rgba64, Float4>?[MaxFramesInFlight];
+    private readonly ID3D12Resource?[] _frameResources = new ID3D12Resource?[MaxFramesInFlight];
 
     private volatile bool _isResizePending = true;
     private volatile float _width = 1;
@@ -108,6 +113,9 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     private CancellationTokenSource? _renderCancellationTokenSource;
     private Thread? _renderThread;
     private ulong _nextFenceValue;
+    private readonly ulong[] _frameFenceValues = new ulong[MaxFramesInFlight];
+    private int _frameIndex;
+    private long _droppedPresentCount;
     private bool _disposed;
 
     /// <summary>
@@ -439,9 +447,11 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     }
 
     /// <summary>
-    /// The core render loop, running on a dedicated background thread.
-    /// Every iteration is individually protected so that a transient failure in any
-    /// single step (resize, dispatch or present) never stops rendering permanently.
+    /// The core render loop, running on a dedicated background thread. Frames are paced only
+    /// by GPU completion — never by the display refresh rate: the frame-latency waitable object
+    /// is not used, and the ring of <see cref="MaxFramesInFlight"/> command lists/frame textures
+    /// keeps the GPU pipeline full. Every iteration is individually protected so that a transient
+    /// failure in any single step (resize, dispatch or present) never stops rendering permanently.
     /// </summary>
     private void RenderThreadMain()
     {
@@ -461,7 +471,8 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
                     }
 
                     IHdrShaderRunner? runner = _shaderRunner;
-                    ReadWriteTexture2D<Rgba64, Float4>? frameBuffer = _frameBuffer;
+                    int slot = _frameIndex % MaxFramesInFlight;
+                    ReadWriteTexture2D<Rgba64, Float4>? frameBuffer = _frameBuffers[slot];
 
                     if (runner is null || frameBuffer is null || _isPaused)
                     {
@@ -469,36 +480,30 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
                         continue;
                     }
 
-                // Wait for the previous present to complete before touching the frame buffer again.
-                // This also paces the render loop to the display refresh rate. The wait is bounded
-                // so that a resize requested while waiting is still applied promptly even if the
-                // waitable object misbehaves (returns on signal, otherwise after the timeout).
-                WaitForSingleObjectEx(_frameLatencyWaitableObject, ResizePollIntervalMs, true);
+                    // Wait only for this slot's previous frame: the ring depth keeps the other
+                    // slot's frame in flight, so the GPU pipeline stays full. The frame-latency
+                    // waitable object is never used, so the loop is paced purely by GPU completion.
+                    WaitForFrameSlot(slot);
 
-                if (TryApplyPendingResize())
-                {
-                    continue;
+                    HdrRenderParameters parameters = new(
+                        IsHdrEnabled: _hdrMode,
+                        SdrWhiteLevelInNits: _sdrWhiteLevelInNits,
+                        MaxLuminanceInNits: _maxLuminanceInNits);
+
+                    if (!runner.TryExecute(frameBuffer, frameBuffer.Width, frameBuffer.Height, stopwatch.Elapsed, parameters))
+                    {
+                        continue;
+                    }
+
+                    PresentFrame(slot);
                 }
-
-                HdrRenderParameters parameters = new(
-                    IsHdrEnabled: _hdrMode,
-                    SdrWhiteLevelInNits: _sdrWhiteLevelInNits,
-                    MaxLuminanceInNits: _maxLuminanceInNits);
-
-                if (!runner.TryExecute(frameBuffer, frameBuffer.Width, frameBuffer.Height, stopwatch.Elapsed, parameters))
+                catch (Exception e)
                 {
-                    continue;
+                    // A single failed iteration must never kill the render loop.
+                    Debug.WriteLine($"[HDR] render iteration failed: {e}");
+
+                    Thread.Sleep(250);
                 }
-
-                PresentFrame(frameBuffer);
-            }
-            catch (Exception e)
-            {
-                // A single failed iteration must never kill the render loop.
-                Debug.WriteLine($"[HDR] render iteration failed: {e}");
-
-                Thread.Sleep(250);
-            }
             }
         }
         catch (Exception e)
@@ -561,22 +566,32 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
             new CommandQueueDescription(CommandListType.Direct, CommandQueuePriority.Normal, CommandQueueFlags.None, 0));
 
         _fence = _d3D12Device.CreateFence(0, FenceFlags.None);
-        _commandAllocator = _d3D12Device.CreateCommandAllocator(CommandListType.Direct);
-        _commandList = _d3D12Device.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, _commandAllocator, null);
 
-        // Command lists are created in the "recording" state: close it so that the
-        // allocator can be reset on the first present.
-        _commandList.Close();
+        for (int i = 0; i < MaxFramesInFlight; i++)
+        {
+            _commandAllocators[i] = _d3D12Device.CreateCommandAllocator(CommandListType.Direct);
+            _commandLists[i] = _d3D12Device.CreateCommandList<ID3D12GraphicsCommandList>(0, CommandListType.Direct, _commandAllocators[i], null);
+
+            // Command lists are created in the "recording" state: close them so that the
+            // allocators can be reset on the first present.
+            _commandLists[i].Close();
+        }
 
         _fullScreenPass = new HdrFullScreenPass(_d3D12Device);
 
         _rtvHeap = _d3D12Device.CreateDescriptorHeap(
             new DescriptorHeapDescription(DescriptorHeapType.RenderTargetView, 2, DescriptorHeapFlags.None, 0));
 
+        // One SRV per ring slot, plus a dedicated heap for the resize first-frame fill whose
+        // descriptor must survive the SRV recreation that follows a swap chain replacement.
         _srvHeap = _d3D12Device.CreateDescriptorHeap(
+            new DescriptorHeapDescription(DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, MaxFramesInFlight, DescriptorHeapFlags.ShaderVisible, 0));
+
+        _fillSrvHeap = _d3D12Device.CreateDescriptorHeap(
             new DescriptorHeapDescription(DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, DescriptorHeapFlags.ShaderVisible, 0));
 
         _rtvIncrementSize = (int)_d3D12Device.GetDescriptorHandleIncrementSize(DescriptorHeapType.RenderTargetView);
+        _srvIncrementSize = (int)_d3D12Device.GetDescriptorHandleIncrementSize(DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
 
         // Event used by SignalAndWait() to actually block until the GPU is idle.
         _fenceEvent = CreateEventW(IntPtr.Zero, false, false, null);
@@ -602,25 +617,71 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     }
 
     /// <summary>
-    /// Creates a composition swap chain with the given buffer size.
+    /// Creates a composition swap chain with the given buffer size. Prefers an
+    /// <c>ALLOW_TEARING</c> chain (vsync-off, unthrottled presents); some composition
+    /// configurations reject the flag, in which case a throttled chain is created instead.
     /// </summary>
     private IDXGISwapChain3 CreateSwapChain(uint width, uint height)
     {
-        SwapChainDescription1 description = new(
-            width: width,
-            height: height,
-            format: Format.R10G10B10A2_UNorm,
-            stereo: false,
-            bufferUsage: Usage.RenderTargetOutput,
-            bufferCount: 2,
-            scaling: Scaling.Stretch,
-            swapEffect: SwapEffect.FlipSequential,
-            alphaMode: AlphaMode.Ignore,
-            flags: SwapChainFlags.FrameLatencyWaitableObject);
+        SwapChainFlags flags = SwapChainFlags.FrameLatencyWaitableObject;
 
-        using IDXGISwapChain1 swapChain1 = _dxgiFactory.CreateSwapChainForComposition(_commandQueue, description, null);
+        IDXGISwapChain3? swapChain3 = TryCreateSwapChain(width, height, flags | SwapChainFlags.AllowTearing);
 
-        return swapChain1.QueryInterface<IDXGISwapChain3>();
+        if (swapChain3 is null)
+        {
+            Debug.WriteLine("[HDR] ALLOW_TEARING rejected, falling back to a vsync-throttled chain.");
+            swapChain3 = TryCreateSwapChain(width, height, flags);
+        }
+
+        if (swapChain3 is null)
+        {
+            throw new InvalidOperationException("Failed to create a composition swap chain with or without ALLOW_TEARING.");
+        }
+
+        // Flip-model swap chains created with FRAME_LATENCY_WAITABLE_OBJECT default to a
+        // maximum frame latency of 1: Present then blocks until the compositor retires the
+        // previous frame (once per vsync), capping the frame rate at the display refresh
+        // regardless of the render loop. Raising it to the ring depth lets rapid presents
+        // coalesce in the compositor (older frames are dropped and their buffers released
+        // immediately), so the frame rate is bounded only by the GPU.
+        swapChain3.MaximumFrameLatency = (uint)MaxFramesInFlight;
+
+        return swapChain3;
+    }
+
+    /// <summary>
+    /// Attempts to create a composition swap chain with the given flags.
+    /// </summary>
+    /// <returns>The new chain, or <c>null</c> if creation failed.</returns>
+    private IDXGISwapChain3? TryCreateSwapChain(uint width, uint height, SwapChainFlags flags)
+    {
+        try
+        {
+            SwapChainDescription1 description = new(
+                width: width,
+                height: height,
+                format: Format.R10G10B10A2_UNorm,
+                stereo: false,
+                bufferUsage: Usage.RenderTargetOutput,
+                bufferCount: 2,
+                scaling: Scaling.Stretch,
+                swapEffect: SwapEffect.FlipSequential,
+                alphaMode: AlphaMode.Ignore,
+                flags: flags);
+
+            using IDXGISwapChain1 swapChain1 = _dxgiFactory.CreateSwapChainForComposition(_commandQueue, description, null);
+
+            IDXGISwapChain3 swapChain3 = swapChain1.QueryInterface<IDXGISwapChain3>();
+
+            _allowTearing = flags.HasFlag(SwapChainFlags.AllowTearing);
+
+            return swapChain3;
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"[HDR] CreateSwapChain({width}x{height}, flags={flags}) failed: {e.Message}");
+            return null;
+        }
     }
 
     /// <summary>
@@ -725,7 +786,10 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     private void FillNewChainWithLastFrame(int width, int height)
     {
         // Nothing to blit on the very first resize (no frame has been rendered yet).
-        if (_frameResource is null)
+        int lastSlot = (_frameIndex - 1 + MaxFramesInFlight) % MaxFramesInFlight;
+        ID3D12Resource? lastFrameResource = _frameIndex > 0 ? _frameResources[lastSlot] : null;
+
+        if (lastFrameResource is null)
         {
             return;
         }
@@ -741,36 +805,49 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
             CpuDescriptorHandle rtvHandle = _rtvHeap.GetCPUDescriptorHandleForHeapStart();
             _d3D12Device.CreateRenderTargetView(backBuffer, null, rtvHandle);
 
-            _commandAllocator.Reset();
-            _commandList.Reset(_commandAllocator, null);
+            // The GPU was drained by ApplyResize, so slot 0's allocator is guaranteed free.
+            ID3D12CommandAllocator commandAllocator = _commandAllocators[0];
+            ID3D12GraphicsCommandList commandList = _commandLists[0];
 
-            _commandList.ResourceBarrierTransition(
-                _frameResource, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource, AllSubresources, ResourceBarrierFlags.None);
+            // Write the SRV into the dedicated fill heap: the per-slot SRVs are recreated by
+            // ApplyResize right after this callback returns, which would otherwise overwrite
+            // the descriptor before the GPU samples it.
+            _d3D12Device.CreateShaderResourceView(lastFrameResource, null, _fillSrvHeap.GetCPUDescriptorHandleForHeapStart());
 
-            _commandList.ResourceBarrierTransition(
+            commandAllocator.Reset();
+            commandList.Reset(commandAllocator, null);
+
+            commandList.ResourceBarrierTransition(
+                lastFrameResource, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource, AllSubresources, ResourceBarrierFlags.None);
+
+            commandList.ResourceBarrierTransition(
                 backBuffer, ResourceStates.Common, ResourceStates.RenderTarget, AllSubresources, ResourceBarrierFlags.None);
 
-            _commandList.SetDescriptorHeaps(_srvHeap);
-            _commandList.SetGraphicsRootSignature(_fullScreenPass.RootSignature);
-            _commandList.SetGraphicsRootDescriptorTable(0, _srvHeap.GetGPUDescriptorHandleForHeapStart());
-            _commandList.OMSetRenderTargets(rtvHandle, null);
-            _commandList.RSSetViewport(0, 0, width, height, 0, 1);
-            _commandList.RSSetScissorRect(width, height);
-            _commandList.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            _commandList.SetPipelineState(_fullScreenPass.PipelineState);
-            _commandList.DrawInstanced(3, 1, 0, 0);
+            commandList.SetDescriptorHeaps(_fillSrvHeap);
+            commandList.SetGraphicsRootSignature(_fullScreenPass.RootSignature);
+            commandList.SetGraphicsRootDescriptorTable(0, _fillSrvHeap.GetGPUDescriptorHandleForHeapStart());
+            commandList.OMSetRenderTargets(rtvHandle, null);
+            commandList.RSSetViewport(0, 0, width, height, 0, 1);
+            commandList.RSSetScissorRect(width, height);
+            commandList.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            commandList.SetPipelineState(_fullScreenPass.PipelineState);
+            commandList.DrawInstanced(3, 1, 0, 0);
 
-            _commandList.ResourceBarrierTransition(
-                _frameResource, ResourceStates.PixelShaderResource, ResourceStates.UnorderedAccess, AllSubresources, ResourceBarrierFlags.None);
+            commandList.ResourceBarrierTransition(
+                lastFrameResource, ResourceStates.PixelShaderResource, ResourceStates.UnorderedAccess, AllSubresources, ResourceBarrierFlags.None);
 
-            _commandList.ResourceBarrierTransition(
+            commandList.ResourceBarrierTransition(
                 backBuffer, ResourceStates.RenderTarget, ResourceStates.Common, AllSubresources, ResourceBarrierFlags.None);
 
-            _commandList.Close();
+            commandList.Close();
 
-            _commandQueue.ExecuteCommandLists(new ID3D12CommandList[] { _commandList });
+            _commandQueue.ExecuteCommandLists(new ID3D12CommandList[] { commandList });
 
-            _swapChain.Present(0, PresentFlags.None);
+            _swapChain.Present(0, _allowTearing ? PresentFlags.AllowTearing : PresentFlags.None);
+
+            // Publish the fence value so the next frame on slot 0 waits for this fill to finish.
+            _frameFenceValues[0] = ++_nextFenceValue;
+            _commandQueue.Signal(_fence, _frameFenceValues[0]);
         }
         catch (Exception e)
         {
@@ -848,23 +925,27 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
                 _d3D12Device.CreateRenderTargetView(_backBuffers[i], null, rtvHeapStart + i * _rtvIncrementSize);
             }
 
-            // Recreate the frame texture and its shader resource view.
-            _frameResource?.Dispose();
-            _frameBuffer?.Dispose();
+            // Recreate the frame textures (one per ring slot) and their shader resource views.
+            for (int i = 0; i < MaxFramesInFlight; i++)
+            {
+                _frameResources[i]?.Dispose();
+                _frameBuffers[i]?.Dispose();
 
-            _frameBuffer = _device.AllocateReadWriteTexture2D<Rgba64, Float4>(width, height);
+                ReadWriteTexture2D<Rgba64, Float4> frameBuffer = _device.AllocateReadWriteTexture2D<Rgba64, Float4>(width, height);
+                _frameBuffers[i] = frameBuffer;
 
-            Guid resourceIid = IID_ID3D12Resource;
-            IntPtr resourcePointer = IntPtr.Zero;
+                Guid resourceIid = IID_ID3D12Resource;
+                IntPtr resourcePointer = IntPtr.Zero;
 
-            InteropServices.GetID3D12Resource(_frameBuffer, &resourceIid, (void**)&resourcePointer);
+                InteropServices.GetID3D12Resource(frameBuffer, &resourceIid, (void**)&resourcePointer);
 
-            _frameResource = new ID3D12Resource(resourcePointer);
+                _frameResources[i] = new ID3D12Resource(resourcePointer);
 
-            // Use a null description so the runtime infers it from the resource
-            // (Texture2D, R16G16B16A16_UNORM, mip 0) — explicit Vortice descriptions
-            // have a layout that crashes the native call.
-            _d3D12Device.CreateShaderResourceView(_frameResource, null, _srvHeap.GetCPUDescriptorHandleForHeapStart());
+                // Use a null description so the runtime infers it from the resource
+                // (Texture2D, R16G16B16A16_UNORM, mip 0) — explicit Vortice descriptions
+                // have a layout that crashes the native call.
+                _d3D12Device.CreateShaderResourceView(_frameResources[i], null, _srvHeap.GetCPUDescriptorHandleForHeapStart() + i * _srvIncrementSize);
+            }
 
             _presentedSinceResize = false;
 
@@ -884,61 +965,116 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
         }
     }
     /// <summary>
-    /// Runs the fullscreen conversion pass and presents the frame.
+    /// Runs the fullscreen conversion pass and presents the frame, using the command list and
+    /// frame texture of the given ring slot, then publishes the slot's fence value.
     /// </summary>
-    private void PresentFrame(ReadWriteTexture2D<Rgba64, Float4> frameBuffer)
+    private void PresentFrame(int slot)
     {
+        ID3D12CommandAllocator commandAllocator = _commandAllocators[slot];
+        ID3D12GraphicsCommandList commandList = _commandLists[slot];
+        ID3D12Resource frameResource = _frameResources[slot]!;
+        ReadWriteTexture2D<Rgba64, Float4> frameBuffer = _frameBuffers[slot]!;
         ID3D12Resource backBuffer = _backBuffers[_swapChain.CurrentBackBufferIndex];
 
-        _commandAllocator.Reset();
-        _commandList.Reset(_commandAllocator, null);
+        commandAllocator.Reset();
+        commandList.Reset(commandAllocator, null);
 
         // Transition the frame texture and the back buffer for the fullscreen pass
-        _commandList.ResourceBarrierTransition(
-            _frameResource!, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource, AllSubresources, ResourceBarrierFlags.None);
+        commandList.ResourceBarrierTransition(
+            frameResource, ResourceStates.UnorderedAccess, ResourceStates.PixelShaderResource, AllSubresources, ResourceBarrierFlags.None);
 
-        _commandList.ResourceBarrierTransition(
+        commandList.ResourceBarrierTransition(
             backBuffer, ResourceStates.Common, ResourceStates.RenderTarget, AllSubresources, ResourceBarrierFlags.None);
 
         // Bind the frame texture SRV
-        _commandList.SetDescriptorHeaps(_srvHeap);
-        _commandList.SetGraphicsRootSignature(_fullScreenPass.RootSignature);
-        _commandList.SetGraphicsRootDescriptorTable(0, _srvHeap.GetGPUDescriptorHandleForHeapStart());
+        GpuDescriptorHandle srvHandle = _srvHeap.GetGPUDescriptorHandleForHeapStart() + slot * _srvIncrementSize;
+        commandList.SetDescriptorHeaps(_srvHeap);
+        commandList.SetGraphicsRootSignature(_fullScreenPass.RootSignature);
+        commandList.SetGraphicsRootDescriptorTable(0, srvHandle);
 
-        _commandList.OMSetRenderTargets(_rtvHeap.GetCPUDescriptorHandleForHeapStart() + (int)_swapChain.CurrentBackBufferIndex * _rtvIncrementSize, null);
-        _commandList.RSSetViewport(0, 0, frameBuffer.Width, frameBuffer.Height, 0, 1);
-        _commandList.RSSetScissorRect(frameBuffer.Width, frameBuffer.Height);
-        _commandList.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-        _commandList.SetPipelineState(_fullScreenPass.PipelineState);
-        _commandList.DrawInstanced(3, 1, 0, 0);
+        commandList.OMSetRenderTargets(_rtvHeap.GetCPUDescriptorHandleForHeapStart() + (int)_swapChain.CurrentBackBufferIndex * _rtvIncrementSize, null);
+        commandList.RSSetViewport(0, 0, frameBuffer.Width, frameBuffer.Height, 0, 1);
+        commandList.RSSetScissorRect(frameBuffer.Width, frameBuffer.Height);
+        commandList.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+        commandList.SetPipelineState(_fullScreenPass.PipelineState);
+        commandList.DrawInstanced(3, 1, 0, 0);
 
         // Transition both resources back
-        _commandList.ResourceBarrierTransition(
-            _frameResource!, ResourceStates.PixelShaderResource, ResourceStates.UnorderedAccess, AllSubresources, ResourceBarrierFlags.None);
+        commandList.ResourceBarrierTransition(
+            frameResource, ResourceStates.PixelShaderResource, ResourceStates.UnorderedAccess, AllSubresources, ResourceBarrierFlags.None);
 
-        _commandList.ResourceBarrierTransition(
+        commandList.ResourceBarrierTransition(
             backBuffer, ResourceStates.RenderTarget, ResourceStates.Common, AllSubresources, ResourceBarrierFlags.None);
 
-        _commandList.Close();
+        commandList.Close();
 
-        _commandQueue.ExecuteCommandLists(new ID3D12CommandList[] { _commandList });
+        _commandQueue.ExecuteCommandLists(new ID3D12CommandList[] { commandList });
 
-        _swapChain.Present(0, PresentFlags.None);
+        // DO_NOT_WAIT + ALLOW_TEARING (when the chain supports it): never block on the
+        // compositor's vsync-paced buffer retirement. When the swap chain's frame queue is
+        // full, Present returns DXGI_ERROR_WAS_STILL_DRAWING and the loop keeps rendering —
+        // the frame is simply dropped (its buffer is overwritten by the next frame). This
+        // keeps the GPU fed continuously instead of idling until the next vsync.
+        PresentFlags presentFlags = _allowTearing ? PresentFlags.AllowTearing | PresentFlags.DoNotWait : PresentFlags.DoNotWait;
+        Result presentResult = _swapChain.Present(0, presentFlags);
 
         // Retired swap chains are NOT disposed here: on this system releasing a swap chain
         // that was attached to the panel (even long after the swap) freezes the panel's
         // display. They are kept alive until the renderer is disposed.
 
-        // A present has now been issued since the last resize (if any).
-        _presentedSinceResize = true;
-
-        // After the first present the swap chain is fully initialized: apply the pending
-        // color space (HDR toggle or detection result) and re-query the output capabilities.
-        if (!_colorSpaceApplied)
+        if (presentResult.Code == (int)Vortice.DXGI.ResultCode.WasStillDrawing)
         {
-            EnsureColorSpaceApplied();
-            RecheckOutput();
+            // The frame did not flip: it must not count as a present for the resize guard,
+            // and the color space must not be applied to a chain that never presented.
+            if (++_droppedPresentCount % 240 == 0)
+            {
+                Debug.WriteLine($"[HDR] dropped {_droppedPresentCount} presents (compositor busy)");
+            }
         }
+        else
+        {
+            if (presentResult.Failure)
+            {
+                Debug.WriteLine($"[HDR] Present failed: {presentResult}");
+            }
+
+            // A present has now been issued since the last resize (if any).
+            _presentedSinceResize = true;
+
+            // After the first present the swap chain is fully initialized: apply the pending
+            // color space (HDR toggle or detection result) and re-query the output capabilities.
+            if (!_colorSpaceApplied)
+            {
+                EnsureColorSpaceApplied();
+                RecheckOutput();
+            }
+        }
+
+        // Publish this slot's fence value (guards its allocator and frame texture reuse)
+        // and advance the ring.
+        ulong fenceValue = ++_nextFenceValue;
+        _frameFenceValues[slot] = fenceValue;
+        _commandQueue.Signal(_fence, fenceValue);
+        _frameIndex++;
+    }
+
+    /// <summary>
+    /// Blocks until the given ring slot's previous frame has completed on the GPU (a no-op when
+    /// it already has). Unlike <see cref="SignalAndWait"/>, this only waits for one slot, leaving
+    /// the other slot's frame in flight so the GPU pipeline stays full.
+    /// </summary>
+    private void WaitForFrameSlot(int slot)
+    {
+        ulong value = _frameFenceValues[slot];
+
+        if (value == 0 || _fence.CompletedValue >= value)
+        {
+            return;
+        }
+
+        _fence.SetEventOnCompletion(value, _fenceEvent).CheckError();
+
+        WaitForSingleObjectEx(_fenceEvent, InfiniteWait, true);
     }
 
     /// <summary>
@@ -1042,13 +1178,23 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
                 _backBuffers[i]?.Dispose();
             }
 
-            _frameResource?.Dispose();
-            _frameBuffer?.Dispose();
+            for (int i = 0; i < MaxFramesInFlight; i++)
+            {
+                _frameResources[i]?.Dispose();
+                _frameBuffers[i]?.Dispose();
+            }
+
+            _fillSrvHeap.Dispose();
             _srvHeap.Dispose();
             _rtvHeap.Dispose();
             _fullScreenPass.Dispose();
-            _commandList.Dispose();
-            _commandAllocator.Dispose();
+
+            for (int i = 0; i < MaxFramesInFlight; i++)
+            {
+                _commandLists[i].Dispose();
+                _commandAllocators[i].Dispose();
+            }
+
             _fence.Dispose();
             _commandQueue.Dispose();
             foreach (IDXGISwapChain3 retired in _retiredSwapChains)

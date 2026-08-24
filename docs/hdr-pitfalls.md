@@ -111,6 +111,43 @@
   丢到后台线程；窗口关闭瞬间返回，进程退出后驱动会回收残留资源。
 - **教训**：凡是"关窗/退出"路径，一律假设 GPU/合成器可能慢，禁止阻塞 UI 线程。
 
+### 1.10 帧率被锁死在显示器刷新率（DWM 节流）——只有 `ALLOW_TEARING` 真正解锁
+
+- **现象**：渲染循环里没有任何显式等待（无 waitable 等待、无 sleep），但：
+  - RTSS OSD 帧率 = 显示器刷新率（稳定锁值），GPU 占用/功率也停在对应的低水平；
+  - 把窗口缩得很小（或被其他窗口遮挡）→ 帧率立刻解锁；
+  - 普通尺寸可见窗口 → 又锁回刷新率。
+- **根因**（整条链都是 DWM 的 vsync 节奏在起作用，逐层排查后确认）：
+  1. 合成型 swapchain（`CreateSwapChainForComposition`）的后缓冲由 **DWM 按 vsync
+     节奏收回**：正常尺寸的可见窗口大约每 vsync 才释放一个缓冲；
+  2. `Present()` 在**没有空闲缓冲**时阻塞——这是 DWM 的调度，应用侧无法绕过；
+  3. 下面这些"解锁"尝试全部无效，因为都不碰这条链：
+     - 移除 waitable 等待、改成 GPU 完成同步的环形流水线 → 只解除了**我们自己**的等待；
+     - `MaximumFrameLatency = 2` → 只放宽"能排队几帧"，DWM 释放节奏不变；
+     - `Present(0, DO_NOT_WAIT)` → 只跳过"等 GPU 忙完"（返回 `WAS_STILL_DRAWING`），
+       **跳不过"等 DWM 释放缓冲"**（文档里 DO_NOT_WAIT 的本义就是不等 GPU）；
+  4. 小窗口/遮挡时 DWM 放松调度、缓冲立即释放 → 解锁。这是"瓶颈在 DWM"的试金石，
+     也解释了为什么这类问题测试结果"时好时坏"（窗口尺寸/遮挡状态在变）。
+- **修复**：**vsync-off 撕裂模式**——
+  - swapchain 创建时加 `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`（要求 flip-model，
+    `FLIP_SEQUENTIAL` ✓）；
+  - `Present(0, PresentFlags.AllowTearing)`（sync interval 必须为 0）；
+  - 效果：Present 不再被 vsync 节流，帧率 = GPU 极限，GPU 占用/功率拉满；
+    代价是快速运动画面可能撕裂（vsync-off 的固有特性）；
+  - 组合型 swapchain 可能拒绝该标志（创建即 `E_INVALIDARG`）→ 实现上先带标志试建、
+    失败回退普通链（本机 Win11 26200 + RTX 5070 Ti 实测支持，Debug 无
+    `ALLOW_TEARING rejected` 日志即生效）。
+- **教训**：
+  1. "帧率锁刷新率"先分清三层再动手：**渲染层**（应用可控）、**Present 层**
+     （DWM 节流，`ALLOW_TEARING` 可控）、**显示层**（物理上限，永不可超——屏幕
+     可见帧数永远不会超过刷新率）；
+  2. RTSS 统计的是 **Present 调用**，不是渲染帧数；"渲染无上限但 RTSS 锁值"时
+     先怀疑计数口径，再怀疑 DWM（用 GPU 占用做旁证：占用低=提交被堵，占用高=
+     渲染已解锁只是显示层在丢帧）；
+  3. 用窗口尺寸变化（变大变小）当诊断开关：DWM 对小型/遮挡窗口放松调度。
+- **验证**：RTSS 无上限 + GPU 占用/功率明显上升；窗口拖动、换 shader、HDR 开关、
+  关闭均无异常。
+
 ---
 
 ## 2. ComputeSharp 层
@@ -370,8 +407,8 @@ XamlRoot.Changed / AppWindow.Changed
    │                                       ├─ TryApplyPendingResize()
    │                                       │    门：_isResizePending
    │                                       │        && _presentedSinceResize
-   │                                       │        && 尺寸稳定 ≥30ms
-   │                                       │        && 退避期已过
+   │                                       │        （无防抖：尺寸变化即应用，仅受
+   │                                       │         两次 ResizeBuffers 间必须有 Present 约束）
    │                                       ├─ 释放旧 backbuffer 包装器
    │                                       ├─ SignalAndWait()  (GPU 空闲)
    │                                       ├─ ReplaceSwapChain(w,h)
@@ -385,12 +422,13 @@ XamlRoot.Changed / AppWindow.Changed
    │                                      继续渲染（旧链尺寸照常画）
    │
    └─ ApplyHdrMode / SetHdrMode ──────────►  _hdrMode + TryApplyColorSpace
-                                              （首帧 present 后由渲染线程应用）
+                                               （首帧 present 后由渲染线程应用）
 ```
 
 要点清单：
 
-- **swapchain**：`R10G10B10A2_UNORM` + `FLIP_SEQUENTIAL` + `FRAME_LATENCY_WAITABLE_OBJECT`；
+- **swapchain**：`R10G10B10A2_UNORM` + `FLIP_SEQUENTIAL` + `FRAME_LATENCY_WAITABLE_OBJECT`
+  + `ALLOW_TEARING`（vsync-off，帧率解锁，见 §1.10）；`MaximumFrameLatency = 2`；
   色彩空间首帧 present 后 `SetColorSpace1`（G2084=HDR10 / G22=SRD）。
 - **面板**：物理尺寸 + `ScaleTransform(1/DpiScale)`；无 `SetMatrixTransform`。
 - **resize**：重建 swapchain（新链先建、UI 线程换绑、旧链延迟释放），绝不 `ResizeBuffers`。
@@ -398,7 +436,8 @@ XamlRoot.Changed / AppWindow.Changed
   `AppWindow.Changed` + 500ms 定时器兜底；WinRT `DisplayInformation` 仅作附加信号。
 - **帧缓冲**：`ReadWriteTexture2D<Rgba64, Float4>`；shader 内做 PQ/sRGB 编码；
   全屏 pass 只搬运（`null` SRV desc、`BlendDescription.Opaque`、command list 先 Close）。
-- **渲染循环**：迭代级 try/catch；有界 waitable 等待；`_presentedSinceResize` 硬保证；
+- **渲染循环**：迭代级 try/catch；**GPU 完成同步的环形流水线**（2 深 command allocator
+  + 每槽帧纹理 ping-pong，无 waitable 等待，见 §1.10）；`_presentedSinceResize` 硬保证；
   失败退避重试；`RenderingFailed` 不杀 runner。
 - **生命周期**：Unloaded 不停循环；事件处理器全部异常安全。
 - **销毁**：两阶段——UI 线程只 `SetSwapChain(null)`；`Join` + GPU 排空 + 逐条
