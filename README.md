@@ -1,6 +1,8 @@
 # ComputeSharpDemo
 
 > 基于 WinUI 3 + ComputeSharp 的 GPU 计算着色器实时渲染示例。
+>
+> 仓库地址：<https://github.com/Johnwikix/ComputeSharpDemo>
 
 一个轻量的 Windows 桌面演示工程，把 [ComputeSharp](https://github.com/Sergio0694/ComputeSharp) 的 HLSL 源生成能力塞进一个 WinUI 3 窗口里，所有画面都由 D3D12 计算着色器产出。支持 HDR/SDR 切换、DPI 适配、多显示器感知，并提供了一个插件式的 Shader 目录，便于扩展。
 
@@ -76,6 +78,7 @@ ComputeSharpDemo/
 │  ├─ hdr-pitfalls.md                 HDR 实现踩坑笔记
 │  └─ screenshots/                    截图占位（待补充）
 ├─ ComputeSharpDemo.slnx              Solution
+├─ LICENSE                            MIT 协议全文
 └─ README.md                          本文件
 ```
 
@@ -138,7 +141,7 @@ ComputeSharpDemo/
 
 ## 许可与致谢
 
-- **本项目代码**：TODO / 待声明
+- **本项目代码**：[MIT](LICENSE) © 2026 Johnwikix
 - **Protean Clouds Shader**：CC BY-NC-SA 3.0 © nimitz
 - **Ray Trace Shader**：本仓库内置
 - 依赖致谢：[ComputeSharp](https://github.com/Sergio0694/ComputeSharp)、[Vortice.Windows](https://github.com/amerkoleci/Vortice.Windows)、[Windows App SDK](https://github.com/microsoft/WindowsAppSDK)、[WinUIEx](https://github.com/dotMorten/WinUIEx)
