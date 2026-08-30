@@ -59,6 +59,7 @@ ComputeSharpDemo/
 │  ├─ Shaders/
 │  │  ├─ ProteanClouds/               nimitz 体积云 shader（自带 pass）
 │  │  ├─ RayTrace/                    蒙特卡洛路径追踪 + 降噪
+│  │  ├─ AppleMusic/                  Apple Music 风格背景（纯计算着色器移植）
 │  │  ├─ ShaderCatalog.cs             元数据列表 + 懒加载工厂
 │  │  ├─ ShaderFactory.cs             IShaderPass 实例缓存
 │  │  ├─ IShaderPass.cs               Pass 抽象（Initialize / OnResize / SetMouse ...）
@@ -105,6 +106,20 @@ ComputeSharpDemo/
     - `RELAX`
 - **能力**：`UsesTime | UsesMouse | UsesResolution`
 
+### Apple Music Inspired
+
+- **类型**：旋转专辑图层 + pinch 液态网格变形背景（Apple Music iOS 16.3 风格）
+- **来源**：移植自 [Lyricify-Backgrounds](https://github.com/WXRIW/Lyricify-Backgrounds) 的 D3D11 顶点+像素着色器实现（Apache-2.0）
+- **协议**：Apache-2.0
+- **能力**：`UsesTime | UsesResolution`
+- **实现要点**：原始实现依赖顶点着色器光栅化（3 个旋转实例四边形 + Catmull-Clark 细分的 pinch 网格）。ComputeSharp 只有计算着色器，因此整个移植是"逐像素反解"：
+  - 旋转图层：每像素逆向执行原 `RotationVertex` 的仿射变换链（变换可逆，覆盖判定为 [-1,1] 方块测试），按原绘制顺序自顶向下求值；
+  - pinch 网格：每像素用牛顿迭代反解 `warp(uv) = pixel`（对网格做双线性插值），不收敛的折叠像素回退到与原始光栅化器等价的三角形穷举扫描（保持索引缓冲的绘制顺序语义）；
+  - 高斯模糊：77 对双线性采样的可分离核，手动实现零边框采样并按 alpha 覆盖率归一化（替代 `LinearZeroBorderSampler`）；
+  - 网格数据存放在两个只读结构化缓冲中，在着色器内按时间混合，无需每帧上传。
+- **默认图片**：`C:\Users\90684\Pictures\3ce2647bd143f6d49cf58a483e6c9aa8.png`（见 `AppleMusicPass.DefaultArtworkPath`，经 WIC 解码、最长边 ≤1024 后上传）
+- **省略项**：频谱驱动的缩放脉冲与专辑切换交叉淡入淡出（原实现依赖音频捕获，Demo 不采集音频）
+
 ## HDR 支持
 
 本工程同时走两条 HDR 探测路径，并合并成一份"有效"能力快照：
@@ -144,4 +159,5 @@ ComputeSharpDemo/
 - **本项目代码**：[MIT](LICENSE) © 2026 Johnwikix
 - **Protean Clouds Shader**：CC BY-NC-SA 3.0 © nimitz
 - **Ray Trace Shader**：本仓库内置
+- **Apple Music Inspired Shader**：移植自 [Lyricify-Backgrounds](https://github.com/WXRIW/Lyricify-Backgrounds)（Apache-2.0 © XY Wang），效果逆向自 Apple Music（iOS 16.3）
 - 依赖致谢：[ComputeSharp](https://github.com/Sergio0694/ComputeSharp)、[Vortice.Windows](https://github.com/amerkoleci/Vortice.Windows)、[Windows App SDK](https://github.com/microsoft/WindowsAppSDK)、[WinUIEx](https://github.com/dotMorten/WinUIEx)

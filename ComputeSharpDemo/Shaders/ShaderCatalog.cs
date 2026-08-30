@@ -1,3 +1,4 @@
+using ComputeSharpDemo.Shaders.AppleMusic;
 using ComputeSharpDemo.Shaders.ProteanClouds;
 using ComputeSharpDemo.Shaders.RayTrace;
 
@@ -39,6 +40,18 @@ public static class ShaderCatalog
                         | ShaderCapabilities.UsesResolution,
             OriginalUrl:  null,
             Factory:      static () => new RayTracePass()),
+        new ShaderAuthoringInfo(
+            Id:           "apple-music-inspired",
+            DisplayName:  "Apple Music Inspired",
+            Description:  "Rotating artwork + pinch mesh background (pure compute port of Lyricify-Backgrounds).",
+            Author:       new ShaderAuthor(
+                              Name:    "Lyricify-Backgrounds",
+                              Url:     null,
+                              License: "Apache-2.0"),
+            Capabilities: ShaderCapabilities.UsesTime
+                        | ShaderCapabilities.UsesResolution,
+            OriginalUrl:  null,
+            Factory:      static () => new AppleMusicPass()),
         // To add a new shader: append one entry here.
         //   - Write a `XxxPass : IShaderPass` class.
         //   - Add an entry above with `Factory: static () => new XxxPass()`.
