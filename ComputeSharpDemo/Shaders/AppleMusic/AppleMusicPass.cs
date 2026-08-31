@@ -44,7 +44,20 @@ public sealed class AppleMusicPass : IShaderPass
     private const float MeshWarpTimeScale = 5f;
 
     /// <summary>Image loaded when no other path is configured.</summary>
-    public const string DefaultArtworkPath = @"C:\Users\90684\Pictures\3ce2647bd143f6d49cf58a483e6c9aa8.png";
+    public const string DefaultArtworkPath = @"C:\Users\90684\Pictures\SavedImage.jpg";
+
+    /// <summary>
+    /// Set to <c>true</c> in DEBUG builds to make artwork-loading failures (missing file,
+    /// decode error) throw instead of silently falling back to a 1×1 black texture. The
+    /// silent fallback masks shader-path bugs and historically has been the entry point
+    /// for races that tear down the D3D12 device and crash dwm.exe.
+    /// </summary>
+    public static bool ThrowOnArtworkFailure { get; set; } =
+#if DEBUG
+        true;
+#else
+        false;
+#endif
 
     /// <summary>Largest artwork edge kept on the GPU (the backdrop samples it at ≤ 1/4 output size).</summary>
     private const uint MaximumArtworkDimension = 1024;
@@ -142,10 +155,12 @@ public sealed class AppleMusicPass : IShaderPass
 
     public void Initialize(GraphicsDevice device, Int2 initialSize)
     {
+        // Defer every GPU resource allocation to the render thread. ComputeSharp's
+        // GraphicsDevice is shared between this call site (UI thread) and the
+        // HdrSwapChainRenderer.RenderThreadMain loop (background thread): recording
+        // D3D12 commands here while the render thread is mid-Dispatch tears the
+        // device down and freezes dwm.exe.
         _device = device;
-
-        EnsureKernel();
-        LoadDefaultArtwork();
     }
 
     public void OnResize(Int2 newSize) { }
@@ -160,6 +175,8 @@ public sealed class AppleMusicPass : IShaderPass
         GraphicsDevice device = _device
             ?? throw new InvalidOperationException("Initialize must be called before dispatch.");
 
+        EnsureKernel();
+        EnsureArtwork();
         EnsureSurfaces(width, height);
         EnsureMesh(width, height);
 
@@ -342,62 +359,99 @@ public sealed class AppleMusicPass : IShaderPass
         _blurWeights = device.AllocateReadOnlyBuffer(BlurWeights);
     }
 
-    /// <summary>
-    /// Loads <see cref="DefaultArtworkPath"/> synchronously (one-time cost at shader
-    /// selection); falls back to a 1×1 black texture when decoding fails.
+/// <summary>
+    /// One-shot artwork loader that runs on the render thread the first time
+    /// <see cref="TryExecute"/> is called. Must never be invoked from the UI thread:
+    /// the underlying <see cref="GraphicsDevice"/> is shared with the render loop, and
+    /// racing it with <see cref="GraphicsDevice.ForEach"/> tears the D3D12 device down.
     /// </summary>
-    private void LoadDefaultArtwork()
+    private void EnsureArtwork()
     {
+        if (_artwork is not null)
+        {
+            return;
+        }
+
         GraphicsDevice device = _device
             ?? throw new InvalidOperationException("Initialize must be called before dispatch.");
 
-        (byte[]? Pixels, int Width, int Height)? decoded = null;
+        byte[]? pixels = null;
+        int width = 0;
+        int height = 0;
 
         try
         {
-            // Task.Run keeps the WinRT continuations off the UI synchronization context,
-            // so blocking here cannot deadlock.
-            decoded = Task.Run(async () => await DecodeArtworkAsync(DefaultArtworkPath))
-                .GetAwaiter()
-                .GetResult();
+            (pixels, width, height) = DecodeArtworkBlocking(DefaultArtworkPath);
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[AppleMusic] artwork decode failed: {ex.Message}");
-        }
+            // A missing artwork is the most common misconfiguration: the original
+            // path on the dev machine has been hard-coded as the default. Rather than
+            // silently uploading a 1×1 black texture on every retry (which masks the
+            // real problem and historically pushed the run into a multi-threaded
+            // device-record race that crashed dwm.exe), surface the failure.
+            Debug.WriteLine(
+                    $"[AppleMusic] artwork load failed for '{DefaultArtworkPath}': {ex.Message}. " +
+                    "Set ComputeSharpDemo.Shaders.AppleMusic.AppleMusicPass.DefaultArtworkPath to a valid PNG.");
 
-        _artwork?.Dispose();
-
-        if (decoded?.Pixels is byte[] pixels)
-        {
-            var rgba = new Rgba32[pixels.Length / 4];
-
-            for (int i = 0; i < rgba.Length; i++)
+            if (ThrowOnArtworkFailure)
             {
-                rgba[i] = new Rgba32(
-                    pixels[i * 4],
-                    pixels[i * 4 + 1],
-                    pixels[i * 4 + 2],
-                    pixels[i * 4 + 3]);
+                throw;
             }
 
-            _artwork = device.AllocateReadOnlyTexture2D<Rgba32, Float4>(rgba, decoded.Value.Width, decoded.Value.Height);
-            _artworkSize = new Int2(decoded.Value.Width, decoded.Value.Height);
+            // Release-build fallback: upload a 1×1 black texture exactly once and
+            // remember the size, so subsequent frames don't re-trigger the decode
+            // (which would otherwise keep the render loop's exception handler busy).
+            pixels = new byte[] { 0, 0, 0, 255 };
+            width = 1;
+            height = 1;
         }
-        else
+
+        var rgba = new Rgba32[pixels.Length / 4];
+
+        for (int i = 0; i < rgba.Length; i++)
         {
-            _artwork = device.AllocateReadOnlyTexture2D<Rgba32, Float4>([new Rgba32(0, 0, 0, 255)], 1, 1);
-            _artworkSize = new Int2(1, 1);
+            rgba[i] = new Rgba32(
+                pixels[i * 4],
+                pixels[i * 4 + 1],
+                pixels[i * 4 + 2],
+                pixels[i * 4 + 3]);
         }
+
+        _artwork = device.AllocateReadOnlyTexture2D<Rgba32, Float4>(rgba, width, height);
+        _artworkSize = new Int2(width, height);
+    }
+
+    /// <summary>
+    /// Blocking decode of the artwork. WinRT continuations must marshal back to a
+    /// dispatcher: this method is intentionally called from the render thread, which
+    /// has no dispatcher, so the decode runs entirely on a thread-pool thread via
+    /// <see cref="Task.Run"/> and is then awaited synchronously.
+    /// </summary>
+    private static (byte[] Pixels, int Width, int Height) DecodeArtworkBlocking(string path)
+    {
+        // Task.Run keeps the WinRT continuations off the UI synchronization context,
+        // so blocking here cannot deadlock even if the caller happens to be the UI thread.
+        return Task.Run(() => DecodeArtworkAsync(path)).GetAwaiter().GetResult();
     }
 
     /// <summary>
     /// Decodes an image file to straight-alpha RGBA8 rows (top row first) via WIC,
     /// downscaling to at most <see cref="MaximumArtworkDimension"/> per edge.
     /// </summary>
-    private static async Task<(byte[]? Pixels, int Width, int Height)> DecodeArtworkAsync(string path)
+    private static async Task<(byte[] Pixels, int Width, int Height)> DecodeArtworkAsync(string path)
     {
-        StorageFile file = await StorageFile.GetFileFromPathAsync(path);
+        StorageFile file;
+        try
+        {
+            file = await StorageFile.GetFileFromPathAsync(path);
+        }
+        catch (System.IO.FileNotFoundException)
+        {
+            // Re-throw synchronously — StorageFile surfaces the file-missing condition
+            // as a different exception type that callers may not recognise.
+            throw;
+        }
 
         using IRandomAccessStream stream = await file.OpenAsync(FileAccessMode.Read);
         BitmapDecoder decoder = await BitmapDecoder.CreateAsync(stream);
