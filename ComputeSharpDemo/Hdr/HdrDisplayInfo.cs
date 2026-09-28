@@ -31,16 +31,9 @@ public readonly record struct HdrDisplayInfo(
                 return "HDR: 不可用";
             }
 
-            string kind = Kind switch
-            {
-                AdvancedColorKind.HighDynamicRange => "HDR",
-                AdvancedColorKind.WideColorGamut => "WCG",
-                _ => Kind.ToString(),
-            };
-
             return MaxLuminanceInNits > 0
-                ? $"{kind}: 可用 · {MaxLuminanceInNits:0} nits"
-                : $"{kind}: 可用";
+                ? $"HDR10: 可用 · 峰值 {MaxLuminanceInNits:0} nits"
+                : "HDR10: 可用";
         }
     }
 }

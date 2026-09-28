@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using ComputeSharp;
 using ComputeSharp.Interop;
@@ -116,6 +116,11 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     private readonly ulong[] _frameFenceValues = new ulong[MaxFramesInFlight];
     private int _frameIndex;
     private long _droppedPresentCount;
+    private long _successfulPresents;
+    private GpuDiagnostics? _diagnostics;
+    private volatile bool _showDiagnostics = true;
+    private string? _lastRenderError;
+    public bool ShowDiagnostics { get => _showDiagnostics; set => _showDiagnostics = value; }
     private bool _disposed;
 
     /// <summary>
@@ -173,20 +178,11 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
     /// </summary>
     public void SetHdrMode(bool isHdrEnabled)
     {
+        if (_hdrMode == isHdrEnabled) return;
         _hdrMode = isHdrEnabled;
-
-        if (!_colorSpaceApplied)
-        {
-            return;
-        }
-
-        TryApplyColorSpace(isHdrEnabled);
+        _colorSpaceApplied = false; // Apply only from the render thread, after present.
     }
 
-    /// <summary>
-    /// Applies the color space matching <see cref="_hdrMode"/>, falling back to SDR if
-    /// the display rejects HDR10. Never throws.
-    /// </summary>
     private void TryApplyColorSpace(bool hdrEnabled)
     {
         ColorSpaceType colorSpace = hdrEnabled
@@ -459,6 +455,7 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
         {
             CancellationToken cancellationToken = _renderCancellationTokenSource!.Token;
             Stopwatch stopwatch = Stopwatch.StartNew();
+            double lastFrameMs = 0;
 
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -483,6 +480,7 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
                     // Wait only for this slot's previous frame: the ring depth keeps the other
                     // slot's frame in flight, so the GPU pipeline stays full. The frame-latency
                     // waitable object is never used, so the loop is paced purely by GPU completion.
+                    long frameStart = Stopwatch.GetTimestamp();
                     WaitForFrameSlot(slot);
 
                     HdrRenderParameters parameters = new(
@@ -495,12 +493,24 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
                         continue;
                     }
 
+                    if (_showDiagnostics)
+                    {
+                        _diagnostics ??= new GpuDiagnostics(_device);
+                        _diagnostics.Draw(frameBuffer, runner, parameters, _successfulPresents, lastFrameMs);
+                    }
                     PresentFrame(slot);
+                    lastFrameMs = Stopwatch.GetElapsedTime(frameStart).TotalMilliseconds;
+                    _lastRenderError = null;
                 }
                 catch (Exception e)
                 {
                     // A single failed iteration must never kill the render loop.
                     Debug.WriteLine($"[HDR] render iteration failed: {e}");
+                    if (_lastRenderError != e.Message)
+                    {
+                        _lastRenderError = e.Message;
+                        _ = _dispatcherQueue.TryEnqueue(() => _owner.OnRenderingFailed(e));
+                    }
 
                     Thread.Sleep(250);
                 }
@@ -881,7 +891,7 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
             for (int i = 0; i < _backBuffers.Length; i++)
             {
                 _backBuffers[i]?.Dispose();
-                _backBuffers[i] = null;
+                _backBuffers[i] = null!;
             }
 
             // Make sure no pending GPU work references the buffers we're about to recreate.
@@ -1037,6 +1047,8 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
             {
                 Debug.WriteLine($"[HDR] Present failed: {presentResult}");
             }
+
+            if (presentResult.Success) _successfulPresents++;
 
             // A present has now been issued since the last resize (if any).
             _presentedSinceResize = true;
@@ -1207,6 +1219,7 @@ internal sealed unsafe class HdrSwapChainRenderer : IDisposable
 
             // Release the runner-owned resources (pass textures) while the render thread is
             // stopped and the GPU is idle, but before the D3D12 device is torn down.
+            _diagnostics?.Dispose();
             beforeDeviceDispose?.Invoke();
 
             // Release the reference we obtained on the underlying D3D12 device. The device

@@ -551,7 +551,8 @@ public readonly partial struct RayTraceShader(
 
         // World-space normal (RGB, stored as n*0.5+0.5) and material id (A) of the primary hit.
         // Sky pixels store a zero normal and material id 3.
-        normalTexture[xy] = new Float4(primaryNormal * 0.5f + 0.5f, primaryMat);
+        // Pack the integer id into UNORM8 instead of clamping all ids above 1 together.
+        normalTexture[xy] = new Float4(primaryNormal * 0.5f + 0.5f, primaryMat / 255.0f);
 
         return new Float4(color, hitDistEnc);
     }

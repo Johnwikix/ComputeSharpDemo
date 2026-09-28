@@ -102,7 +102,7 @@ public readonly partial struct SpatialFilterShader(
         Float4 n4 = normalTexture[xy];
 
         Float3 n0 = DecodeNormal(n4);
-        int m0 = (int)n4.W;
+        int m0 = (int)Hlsl.Round(n4.W * 255.0f);
         float l0 = Luminance(c.RGB);
         float var0 = Hlsl.Max(c.W, 1e-4f);
 
@@ -134,7 +134,7 @@ public readonly partial struct SpatialFilterShader(
 
                 float w = ComputeWeight(
                     n0, t0, m0, l0, var0,
-                    DecodeNormal(tn), ToMeters(signalDistance[p].W), (int)tn.W, Luminance(tap.RGB), depthSigma);
+                    DecodeNormal(tn), ToMeters(signalDistance[p].W), (int)Hlsl.Round(tn.W * 255.0f), Luminance(tap.RGB), depthSigma);
 
                 acc += tap.RGB * w;
                 vAcc += tap.W * w;

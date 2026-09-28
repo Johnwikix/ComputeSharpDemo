@@ -16,6 +16,17 @@ namespace ComputeSharpDemo;
 
 public sealed partial class MainWindow : WindowEx
 {
+    private readonly SettingsWindow _settings = new();
+    private readonly HashSet<IShaderPass> _initializedPasses = [];
+    private readonly DispatcherTimer _recheckTimer = new() { Interval = TimeSpan.FromSeconds(1) };
+    private ComboBox ShaderSelector => _settings.ShaderSelector;
+    private ComboBox ModelSelector => _settings.ModelSelector;
+    private ComboBox DenoiserSelector => _settings.DenoiserSelector;
+    private NumberBox MaxBouncesBox => _settings.MaxBouncesBox;
+    private NumberBox SamplesBox => _settings.SamplesBox;
+    private FrameworkElement RayTraceParamBar => _settings.RayTraceParamBar;
+    private ToggleSwitch HdrToggle => _settings.HdrToggle;
+    private TextBlock HdrStatusText => _settings.HdrStatusText;
     private GraphicsDevice _device = null!;
     private ShaderFactory _factory = null!;
     private HdrShaderPanel _shaderPanel = null!;
@@ -36,9 +47,21 @@ public sealed partial class MainWindow : WindowEx
         InitializeComponent();
         Title = "ComputeSharp Demo";
         AppWindow.TitleBar.PreferredTheme = TitleBarTheme.UseDefaultAppMode;
-        AppWindow.TitleBar.ExtendsContentIntoTitleBar = true;
-        AppWindow.TitleBar.PreferredHeightOption = TitleBarHeightOption.Standard;
-        this.SetTitleBarBackgroundColors(Colors.Transparent);
+        AppWindow.ResizeClient(new SizeInt32(1280, 720));
+        MinWidth = 480; MinHeight = 320;
+        ShaderSelector.SelectionChanged += OnShaderSelected;
+        DenoiserSelector.SelectionChanged += OnDenoiserSelected;
+        MaxBouncesBox.ValueChanged += OnMaxBouncesChanged;
+        SamplesBox.ValueChanged += OnSamplesChanged;
+        HdrToggle.Toggled += OnHdrToggled;
+        ModelSelector.SelectionChanged += (_, _) =>
+        {
+            if (!_syncingRayTraceParams && ModelSelector.SelectedIndex >= 0 && _activePass is RayTracePass pass)
+                pass.SceneIndex = ModelSelector.SelectedIndex;
+        };
+        _settings.ResetCameraButton.Click += (_, _) => { if (_activePass is RayTracePass pass) pass.SceneIndex = pass.SceneIndex; };
+        _settings.DiagnosticsToggle.Toggled += (_, _) => { if (_shaderPanel != null) _shaderPanel.ShowDiagnostics = _settings.DiagnosticsToggle.IsOn; };
+        _settings.ResolutionButton.Click += (_, _) => AppWindow.ResizeClient(new SizeInt32(1280, 720));
         // Create the GPU device and shader panel
         _device = GraphicsDevice.GetDefault();
         _factory = new ShaderFactory();
@@ -62,9 +85,8 @@ public sealed partial class MainWindow : WindowEx
         AppWindow.Changed += OnAppWindowChanged;
 
         // Safety-net output recheck (HDR state can change without a window event)
-        var recheckTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
-        recheckTimer.Tick += (_, _) => UpdateWindowBoundsAndRecheckOutput();
-        recheckTimer.Start();
+        _recheckTimer.Tick += (_, _) => UpdateWindowBoundsAndRecheckOutput();
+        _recheckTimer.Start();
 
         // HDR detection is deferred until the window is activated: DisplayInformation
         // is not reliably available while the window is still being constructed.
@@ -117,8 +139,7 @@ public sealed partial class MainWindow : WindowEx
 
     private void SwitchShader(ShaderAuthoringInfo info)
     {
-        // Dispose the old pass entirely (destroys its GPU resources).
-        _activePass?.Dispose();
+        // Cached passes stay alive until the renderer has stopped. Never dispose GPU resources on this UI thread.
 
         var pass = _factory.GetOrCreate(info.Id);
         Int2 size = default;
@@ -128,14 +149,14 @@ public sealed partial class MainWindow : WindowEx
             size = new Int2((int)_shaderPanel.ActualWidth, (int)_shaderPanel.ActualHeight);
         }
 
-        pass.Initialize(_device, size);
+        if (_initializedPasses.Add(pass)) pass.Initialize(_device, size);
         pass.OnResize(size);
 
         _shaderPanel.ShaderRunner = pass;
         _shaderPanel.IsPaused = false;
         _activePass = pass;
 
-        AuthorText.Text = info.DisplayName;
+        _settings.ErrorText.Text = string.Empty;
 
         if (pass is RayTracePass rayTracePass)
         {
@@ -161,6 +182,8 @@ public sealed partial class MainWindow : WindowEx
         try
         {
             RayTraceParamBar.Visibility = Visibility.Visible;
+            if (!ReferenceEquals(ModelSelector.ItemsSource, pass.Scenes)) ModelSelector.ItemsSource = pass.Scenes;
+            ModelSelector.SelectedIndex = pass.SceneIndex;
             DenoiserSelector.SelectedIndex = (int)pass.DenoiserMode;
             MaxBouncesBox.Value = pass.MaxBounces;
             SamplesBox.Value = pass.Samples;
@@ -356,7 +379,7 @@ public sealed partial class MainWindow : WindowEx
 
             double dpiScale = DpiScale;
             double contentWidth = RootGrid.ActualWidth;
-            double contentHeight = Math.Max(1, RootGrid.ActualHeight - ToolbarHeight);
+            double contentHeight = Math.Max(1, RootGrid.ActualHeight);
 
             double w = Math.Round(contentWidth * dpiScale);
             double h = Math.Round(contentHeight * dpiScale);
@@ -391,19 +414,10 @@ public sealed partial class MainWindow : WindowEx
         });
     }
 
-    private double ToolbarHeight
+    private void OnOpenSettings(object sender, RoutedEventArgs e) => _settings.Activate();
+    private void OnSettingsShortcut(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs e)
     {
-        get
-        {
-            double total = 0;
-            var rows = RootGrid.RowDefinitions;
-            for (int i = 0; i < rows.Count - 1; i++)
-            {
-                total += rows[i].ActualHeight;
-            }
-
-            return total;
-        }
+        _settings.Activate(); e.Handled = true;
     }
 
     // Keeps the current-output HDR state in sync with the window position (multi-monitor).
@@ -430,12 +444,18 @@ public sealed partial class MainWindow : WindowEx
         // Do NOT clear the shader runner: the render loop is resilient to transient
         // errors (resizes, presents), so a single failure must not stop rendering.
         Debug.WriteLine($"Rendering failed: {e}");
+        _settings.ErrorText.Text = e.ToString();
+        _settings.Activate();
     }
 
     private void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        _recheckTimer.Stop();
+        _settings.AllowClose = true;
+        _settings.Close();
+        _hdrTracker?.Dispose();
 
         if (RootGrid.XamlRoot is XamlRoot xamlRoot)
         {
@@ -450,7 +470,7 @@ public sealed partial class MainWindow : WindowEx
         _shaderPanel.Dispose(() =>
         {
             _factory.Dispose();
-            _hdrTracker?.Dispose();
+
         });
 
         _stopwatch.Stop();

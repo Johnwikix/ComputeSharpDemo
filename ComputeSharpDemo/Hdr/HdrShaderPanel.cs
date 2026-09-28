@@ -73,12 +73,14 @@ public sealed class HdrShaderPanel : SwapChainPanel, IDisposable
     public bool IsPaused
     {
         get => _isPaused;
-        set => _isPaused = value;
+        set { _isPaused = value; _renderer.IsPaused = value; }
     }
 
     /// <summary>
     /// Enables or disables HDR10 output (ST 2084 / BT.2020 color space).
     /// </summary>
+    public bool ShowDiagnostics { get => _renderer.ShowDiagnostics; set => _renderer.ShowDiagnostics = value; }
+
     public bool IsHdrEnabled
     {
         get => _renderer.IsHdrEnabled;
